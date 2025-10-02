@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  postgresql2prisma:
+    build: .
+    container_name: postgresql2prisma
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./db_config.json:/app/db_config.json
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
