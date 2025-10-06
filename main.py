@@ -193,6 +193,20 @@ HTML_TEMPLATE = '''
                         <h2 class="text-lg font-medium text-slate-900">Selecione as Tabelas</h2>
                     </div>
                     <div class="p-6">
+                        <!-- Campo de Busca -->
+                        <div class="mb-4">
+                            <div class="flex gap-2">
+                                <input type="text" id="searchSchemaTable" placeholder="Buscar schema ou tabela (ex: public.users ou apenas users)"
+                                       class="flex-1 px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-transparent"
+                                       onkeypress="if(event.key == 'Enter') searchSchemaOrTable()">
+                                <button onclick="searchSchemaOrTable()"
+                                        class="px-4 py-2 bg-slate-900 text-white text-sm font-medium rounded-md hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:ring-offset-2 transition-colors">
+                                    Buscar
+                                </button>
+                            </div>
+                            <div id="searchResult" class="mt-2"></div>
+                        </div>
+
                         <div id="loadingTree" class="hidden text-center py-8">
                             <div class="spinner mx-auto mb-2"></div>
                             <p class="text-sm text-slate-500">Carregando schemas e tabelas...</p>
@@ -542,6 +556,68 @@ HTML_TEMPLATE = '''
                 }
             } catch (error) {
                 alert('Erro: ' + error.message);
+            }
+        }
+
+        async function searchSchemaOrTable() {
+            const input = document.getElementById('searchSchemaTable');
+            const searchValue = input.value.trim();
+            const resultDiv = document.getElementById('searchResult');
+
+            if (!searchValue) {
+                resultDiv.innerHTML = '<p class="text-sm text-slate-500">Digite um schema ou tabela para buscar</p>';
+                return;
+            }
+
+            resultDiv.innerHTML = '<div class="flex items-center gap-2 text-sm text-slate-500"><div class="spinner" style="width: 16px; height: 16px; border-width: 2px;"></div>Buscando...</div>';
+
+            try {
+                const response = await fetch('/search', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query: searchValue})
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    let html = '';
+
+                    if (result.schema_found) {
+                        html += `<div class="p-3 bg-green-50 border border-green-200 rounded-md text-sm">
+                            <p class="text-green-900"><strong>✓ Schema encontrado:</strong> ${result.schema}</p>
+                            <p class="text-green-700 mt-1">${result.table_count} tabela(s) neste schema</p>
+                        </div>`;
+                    }
+
+                    if (result.tables && result.tables.length > 0) {
+                        html += `<div class="p-3 bg-green-50 border border-green-200 rounded-md text-sm">
+                            <p class="text-green-900 mb-2"><strong>✓ ${result.tables.length} tabela(s) encontrada(s):</strong></p>
+                            <ul class="space-y-1">`;
+
+                        result.tables.forEach(item => {
+                            html += `<li class="text-green-800">• <span class="font-mono">${item.schema}.${item.table}</span></li>`;
+                        });
+
+                        html += `</ul></div>`;
+                    }
+
+                    if (!result.schema_found && (!result.tables || result.tables.length === 0)) {
+                        html += `<div class="p-3 bg-red-50 border border-red-200 rounded-md text-sm">
+                            <p class="text-red-900"><strong>✗ Não encontrado:</strong> ${searchValue}</p>
+                        </div>`;
+                    }
+
+                    resultDiv.innerHTML = html;
+                } else {
+                    resultDiv.innerHTML = `<div class="p-3 bg-red-50 border border-red-200 rounded-md text-sm">
+                        <p class="text-red-900">Erro: ${result.error}</p>
+                    </div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="p-3 bg-red-50 border border-red-200 rounded-md text-sm">
+                    <p class="text-red-900">Erro: ${error.message}</p>
+                </div>`;
             }
         }
 
@@ -968,6 +1044,63 @@ def extract_database_metadata(conn, selected_schemas=None):
         if cursor:
             cursor.close()
 
+def schema_exists(conn, schema_name):
+    """
+    Verifica se um schema existe no banco de dados.
+
+    Args:
+        conn: Conexão com o banco de dados PostgreSQL
+        schema_name: Nome do schema a verificar
+
+    Returns:
+        bool: True se o schema existe, False caso contrário
+    """
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT EXISTS(
+                SELECT 1
+                FROM information_schema.schemata
+                WHERE schema_name = %s
+            )
+        """, (schema_name,))
+
+        return cursor.fetchone()[0]
+    finally:
+        if cursor:
+            cursor.close()
+
+def table_exists(conn, schema_name, table_name):
+    """
+    Verifica se uma tabela existe em um schema específico.
+
+    Args:
+        conn: Conexão com o banco de dados PostgreSQL
+        schema_name: Nome do schema onde procurar
+        table_name: Nome da tabela a verificar
+
+    Returns:
+        bool: True se a tabela existe, False caso contrário
+    """
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT EXISTS(
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                  AND table_name = %s
+                  AND table_type = 'BASE TABLE'
+            )
+        """, (schema_name, table_name))
+
+        return cursor.fetchone()[0]
+    finally:
+        if cursor:
+            cursor.close()
+
 def map_postgres_to_prisma_type(pg_type):
     """Mapeia tipos PostgreSQL para tipos Prisma"""
     type_mapping = {
@@ -1250,6 +1383,131 @@ def table_details():
         })
     except Exception as e:
         logger.error(f"Erro ao buscar detalhes da tabela: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.route('/search', methods=['POST'])
+def search():
+    """Busca por schema ou tabela no banco de dados (exata ou parcial)"""
+    conn = None
+    try:
+        data = request.json
+        query = data.get('query', '').strip()
+
+        if not query:
+            return jsonify({'error': 'Query vazia'}), 400
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Não conectado ao banco de dados'}), 500
+
+        cursor = conn.cursor()
+        result_data = {
+            'schema_found': False,
+            'tables': []
+        }
+
+        # Verifica se a query contém ponto (schema.tabela)
+        if '.' in query:
+            parts = query.split('.')
+            schema_name = parts[0].strip()
+            table_name = parts[1].strip()
+
+            # Busca exata
+            cursor.execute("""
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                  AND table_name = %s
+                  AND table_type = 'BASE TABLE'
+                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                  AND table_name !~ '(_p|p_|_)[0-9]+$'
+            """, (schema_name, table_name))
+
+            exact_match = cursor.fetchone()
+
+            if exact_match:
+                result_data['tables'].append({
+                    'schema': exact_match[0],
+                    'table': exact_match[1]
+                })
+            else:
+                # Busca parcial no schema especificado
+                cursor.execute("""
+                    SELECT table_schema, table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_name ILIKE %s
+                      AND table_type = 'BASE TABLE'
+                      AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                      AND table_name !~ '(_p|p_|_)[0-9]+$'
+                    ORDER BY table_name
+                """, (schema_name, f'%{table_name}%'))
+
+                for row in cursor.fetchall():
+                    result_data['tables'].append({
+                        'schema': row[0],
+                        'table': row[1]
+                    })
+        else:
+            # Primeiro tenta como schema
+            if schema_exists(conn, query):
+                cursor.execute("""
+                    SELECT COUNT(*)
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_type = 'BASE TABLE'
+                """, (query,))
+                table_count = cursor.fetchone()[0]
+
+                result_data['schema_found'] = True
+                result_data['schema'] = query
+                result_data['table_count'] = table_count
+
+            # Busca exata de tabelas em todos os schemas
+            cursor.execute("""
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_name = %s
+                  AND table_type = 'BASE TABLE'
+                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                  AND table_name !~ '(_p|p_|_)[0-9]+$'
+                ORDER BY table_schema, table_name
+            """, (query,))
+
+            exact_matches = cursor.fetchall()
+            for row in exact_matches:
+                result_data['tables'].append({
+                    'schema': row[0],
+                    'table': row[1]
+                })
+
+            # Se não encontrou nada exato, busca parcial
+            if not result_data['schema_found'] and len(result_data['tables']) == 0:
+                cursor.execute("""
+                    SELECT table_schema, table_name
+                    FROM information_schema.tables
+                    WHERE table_name ILIKE %s
+                      AND table_type = 'BASE TABLE'
+                      AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                      AND table_name !~ '(_p|p_|_)[0-9]+$'
+                    ORDER BY table_schema, table_name
+                    LIMIT 50
+                """, (f'%{query}%',))
+
+                for row in cursor.fetchall():
+                    result_data['tables'].append({
+                        'schema': row[0],
+                        'table': row[1]
+                    })
+
+        cursor.close()
+        return jsonify(result_data)
+
+    except Exception as e:
+        logger.error(f"Erro na busca: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         if conn:
