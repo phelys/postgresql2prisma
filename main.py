@@ -9,6 +9,11 @@ import json
 import os
 from datetime import datetime
 import logging
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Carrega variáveis de ambiente
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)  # Adiciona suporte CORS
@@ -22,6 +27,21 @@ connection_pool = None
 
 # Arquivo para persistir configurações
 CONFIG_FILE = 'db_config.json'
+
+# Cliente Grok (xAI) para integração com IA
+grok_client = None
+try:
+    api_key = os.getenv('XAI_API_KEY')
+    if api_key:
+        grok_client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1"
+        )
+        logger.info("Cliente Grok (xAI) inicializado com sucesso")
+    else:
+        logger.warning("XAI_API_KEY não encontrada. Recurso de dicionário de dados desabilitado.")
+except Exception as e:
+    logger.error(f"Erro ao inicializar cliente Grok: {e}")
 
 def load_config():
     """Carrega configurações salvas do arquivo JSON"""
@@ -150,6 +170,24 @@ HTML_TEMPLATE = '''
 
             <!-- Navegação -->
             <div id="navigationSection" class="hidden">
+                <!-- Tabs -->
+                <div class="bg-white rounded-lg border border-slate-200 shadow-sm mb-6">
+                    <div class="border-b border-slate-200">
+                        <nav class="flex -mb-px">
+                            <button onclick="switchTab('schemas')" id="tabSchemas"
+                                    class="tab-button active px-6 py-4 text-sm font-medium border-b-2 border-slate-900 text-slate-900">
+                                Gerador de Schema
+                            </button>
+                            <button onclick="switchTab('dictionary')" id="tabDictionary"
+                                    class="tab-button px-6 py-4 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300">
+                                Dicionário de Dados (IA)
+                            </button>
+                        </nav>
+                    </div>
+                </div>
+
+                <!-- Tab Content: Schema Generator -->
+                <div id="contentSchemas" class="tab-content">
                 <div class="bg-white rounded-lg border border-slate-200 shadow-sm mb-6">
                     <div class="px-6 py-4 border-b border-slate-200">
                         <h2 class="text-lg font-medium text-slate-900">Selecione as Tabelas</h2>
@@ -204,6 +242,63 @@ HTML_TEMPLATE = '''
                         </button>
                     </div>
                 </div>
+                </div>
+                <!-- End Tab Content: Schema Generator -->
+
+                <!-- Tab Content: Data Dictionary -->
+                <div id="contentDictionary" class="tab-content hidden">
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <!-- Schema Selection -->
+                        <div class="lg:col-span-1">
+                            <div class="bg-white rounded-lg border border-slate-200 shadow-sm sticky top-6">
+                                <div class="px-6 py-4 border-b border-slate-200">
+                                    <h2 class="text-lg font-medium text-slate-900">Selecione os Schemas</h2>
+                                </div>
+                                <div class="p-6">
+                                    <div id="schemasList" class="space-y-2 max-h-96 overflow-y-auto">
+                                        <!-- Schema checkboxes will be populated here -->
+                                    </div>
+                                    <button onclick="startDictionaryChat()"
+                                            class="mt-4 w-full px-4 py-2 bg-slate-900 text-white text-sm font-medium rounded-md hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:ring-offset-2 transition-colors">
+                                        Iniciar Análise
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Chat Area -->
+                        <div class="lg:col-span-2">
+                            <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+                                <div class="px-6 py-4 border-b border-slate-200">
+                                    <h2 class="text-lg font-medium text-slate-900">Chat - Dicionário de Dados</h2>
+                                    <p class="text-xs text-slate-500 mt-1">Converse com a IA sobre sua estrutura de banco de dados</p>
+                                </div>
+
+                                <!-- Chat Messages -->
+                                <div id="chatMessages" class="p-6 h-96 overflow-y-auto bg-slate-50">
+                                    <div class="text-center text-sm text-slate-400 py-12">
+                                        Selecione os schemas e clique em "Iniciar Análise" para começar
+                                    </div>
+                                </div>
+
+                                <!-- Chat Input -->
+                                <div class="px-6 py-4 border-t border-slate-200">
+                                    <div class="flex gap-2">
+                                        <input type="text" id="chatInput" placeholder="Digite sua pergunta sobre o banco de dados..."
+                                               class="flex-1 px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-transparent"
+                                               onkeypress="if(event.key == 'Enter') sendMessage()">
+                                        <button onclick="sendMessage()"
+                                                class="px-4 py-2 bg-slate-900 text-white text-sm font-medium rounded-md hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:ring-offset-2 transition-colors">
+                                            Enviar
+                                        </button>
+                                    </div>
+                                    <div id="chatStatus" class="mt-2 text-xs text-slate-500"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- End Tab Content: Data Dictionary -->
             </div>
         </div>
     </div>
@@ -405,7 +500,7 @@ HTML_TEMPLATE = '''
         async function generateSchemas() {
             const checkboxes = document.querySelectorAll('input[type="checkbox"]:checked');
             const selected = [];
-            
+
             checkboxes.forEach(cb => {
                 const parts = cb.id.replace('cb-', '').split('-');
                 selected.push({
@@ -449,10 +544,429 @@ HTML_TEMPLATE = '''
                 alert('Erro: ' + error.message);
             }
         }
+
+        // ===== DATA DICTIONARY FUNCTIONS =====
+
+        let conversationHistory = [];
+        let selectedSchemas = [];
+
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.classList.remove('active', 'border-slate-900', 'text-slate-900');
+                btn.classList.add('border-transparent', 'text-slate-500');
+            });
+
+            if (tabName === 'schemas') {
+                document.getElementById('tabSchemas').classList.add('active', 'border-slate-900', 'text-slate-900');
+                document.getElementById('tabSchemas').classList.remove('border-transparent', 'text-slate-500');
+            } else {
+                document.getElementById('tabDictionary').classList.add('active', 'border-slate-900', 'text-slate-900');
+                document.getElementById('tabDictionary').classList.remove('border-transparent', 'text-slate-500');
+            }
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.add('hidden');
+            });
+
+            if (tabName === 'schemas') {
+                document.getElementById('contentSchemas').classList.remove('hidden');
+            } else {
+                document.getElementById('contentDictionary').classList.remove('hidden');
+                loadSchemasForDictionary();
+            }
+        }
+
+        function loadSchemasForDictionary() {
+            const container = document.getElementById('schemasList');
+
+            if (Object.keys(schemasData).length === 0) {
+                container.innerHTML = '<p class="text-sm text-slate-400">Nenhum schema disponível</p>';
+                return;
+            }
+
+            container.innerHTML = '';
+
+            for (const schema of Object.keys(schemasData)) {
+                const schemaDiv = document.createElement('div');
+                schemaDiv.className = 'flex items-center gap-2 px-3 py-2 bg-slate-50 border border-slate-200 rounded-md';
+                schemaDiv.innerHTML = `
+                    <input type="checkbox" id="schema-${schema}" value="${schema}"
+                           class="w-4 h-4 text-slate-900 border-slate-300 rounded focus:ring-slate-900">
+                    <label for="schema-${schema}" class="text-sm text-slate-700 cursor-pointer flex-1">
+                        📁 ${schema} <span class="text-xs text-slate-500">(${schemasData[schema].length} tabelas)</span>
+                    </label>
+                `;
+                container.appendChild(schemaDiv);
+            }
+        }
+
+        async function startDictionaryChat() {
+            const checkboxes = document.querySelectorAll('#schemasList input[type="checkbox"]:checked');
+            selectedSchemas = Array.from(checkboxes).map(cb => cb.value);
+
+            if (selectedSchemas.length === 0) {
+                alert('Selecione pelo menos um schema!');
+                return;
+            }
+
+            // Clear chat
+            conversationHistory = [];
+            const chatMessages = document.getElementById('chatMessages');
+            chatMessages.innerHTML = `
+                <div class="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-md">
+                    <p class="text-sm text-blue-900">
+                        <strong>Schemas selecionados:</strong> ${selectedSchemas.join(', ')}
+                    </p>
+                    <p class="text-xs text-blue-700 mt-2">
+                        Faça perguntas sobre a estrutura do banco de dados, relacionamentos entre tabelas, ou peça uma análise geral.
+                    </p>
+                </div>
+            `;
+
+            // Enable input
+            document.getElementById('chatInput').disabled = false;
+            document.getElementById('chatInput').focus();
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('chatInput');
+            const message = input.value.trim();
+
+            if (!message) return;
+
+            if (selectedSchemas.length === 0) {
+                alert('Primeiro inicie a análise selecionando os schemas!');
+                return;
+            }
+
+            // Add user message to chat
+            addMessageToChat('user', message);
+            input.value = '';
+
+            // Show loading
+            const status = document.getElementById('chatStatus');
+            status.textContent = 'Aguardando resposta da IA...';
+            status.className = 'mt-2 text-xs text-blue-600';
+
+            try {
+                const response = await fetch('/api/data-dictionary/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        message: message,
+                        schemas: selectedSchemas,
+                        history: conversationHistory
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    // Add assistant message
+                    addMessageToChat('assistant', data.message);
+
+                    // Update conversation history
+                    conversationHistory.push({role: 'user', content: message});
+                    conversationHistory.push({role: 'assistant', content: data.message});
+
+                    // Update status with token usage
+                    status.textContent = `Tokens: ${data.usage.input_tokens} entrada, ${data.usage.output_tokens} saída | Modelo: ${data.model}`;
+                    status.className = 'mt-2 text-xs text-slate-500';
+                } else {
+                    status.textContent = 'Erro: ' + data.error;
+                    status.className = 'mt-2 text-xs text-red-600';
+
+                    addMessageToChat('system', '❌ Erro: ' + data.error);
+                }
+            } catch (error) {
+                status.textContent = 'Erro de conexão: ' + error.message;
+                status.className = 'mt-2 text-xs text-red-600';
+
+                addMessageToChat('system', '❌ Erro de conexão: ' + error.message);
+            }
+        }
+
+        function addMessageToChat(role, content) {
+            const chatMessages = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'mb-4';
+
+            if (role === 'user') {
+                messageDiv.innerHTML = `
+                    <div class="flex justify-end">
+                        <div class="max-w-3xl px-4 py-2 bg-slate-900 text-white rounded-lg">
+                            <p class="text-sm whitespace-pre-wrap">${escapeHtml(content)}</p>
+                        </div>
+                    </div>
+                `;
+            } else if (role === 'assistant') {
+                messageDiv.innerHTML = `
+                    <div class="flex justify-start">
+                        <div class="max-w-3xl px-4 py-2 bg-white border border-slate-200 rounded-lg">
+                            <div class="text-sm prose prose-sm max-w-none">${formatMarkdown(content)}</div>
+                        </div>
+                    </div>
+                `;
+            } else if (role === 'system') {
+                messageDiv.innerHTML = `
+                    <div class="px-4 py-2 bg-red-50 border border-red-200 rounded-lg">
+                        <p class="text-sm text-red-900">${escapeHtml(content)}</p>
+                    </div>
+                `;
+            }
+
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatMarkdown(text) {
+            // Escape HTML first
+            const div = document.createElement('div');
+            div.textContent = text;
+            let formatted = div.innerHTML;
+
+            // Bold: **text**
+            formatted = formatted.split('**').map(function(part, i) {
+                return i % 2 == 1 ? '<strong>' + part + '</strong>' : part;
+            }).join('');
+
+            // Inline code: `code`
+            formatted = formatted.split('`').map(function(part, i) {
+                return i % 2 == 1 ? '<code class="px-1 py-0.5 bg-slate-100 rounded text-xs font-mono">' + part + '</code>' : part;
+            }).join('');
+
+            // Replace line breaks with <br>
+            formatted = formatted.split('\\n').join('<br>');
+
+            return formatted;
+        }
     </script>
 </body>
 </html>
 '''
+
+def extract_database_metadata(conn, selected_schemas=None):
+    """
+    Extrai metadados completos do banco de dados incluindo schemas, tabelas, colunas,
+    constraints, relacionamentos e índices.
+
+    Args:
+        conn: Conexão com o banco de dados PostgreSQL
+        selected_schemas: Lista de schemas a extrair. Se None, extrai todos (exceto system schemas)
+
+    Returns:
+        dict: Metadados estruturados do banco de dados
+    """
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        metadata = {
+            'database_name': '',
+            'schemas': {}
+        }
+
+        # Nome do banco de dados
+        cursor.execute("SELECT current_database()")
+        metadata['database_name'] = cursor.fetchone()[0]
+
+        # Query para buscar schemas
+        schema_filter = ""
+        if selected_schemas:
+            schema_placeholders = ','.join(['%s'] * len(selected_schemas))
+            schema_filter = f"AND table_schema IN ({schema_placeholders})"
+
+        # Busca todas as tabelas dos schemas selecionados
+        query = f"""
+            SELECT DISTINCT table_schema
+            FROM information_schema.tables
+            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND table_type = 'BASE TABLE'
+              {schema_filter}
+            ORDER BY table_schema
+        """
+
+        if selected_schemas:
+            cursor.execute(query, tuple(selected_schemas))
+        else:
+            cursor.execute(query)
+
+        schemas = [row[0] for row in cursor.fetchall()]
+
+        for schema_name in schemas:
+            metadata['schemas'][schema_name] = {'tables': {}}
+
+            # Busca tabelas do schema
+            cursor.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+            """, (schema_name,))
+
+            tables = [row[0] for row in cursor.fetchall()]
+
+            for table_name in tables:
+                table_metadata = {
+                    'columns': [],
+                    'primary_keys': [],
+                    'foreign_keys': [],
+                    'indexes': [],
+                    'constraints': []
+                }
+
+                # Busca colunas
+                cursor.execute("""
+                    SELECT
+                        column_name,
+                        data_type,
+                        character_maximum_length,
+                        numeric_precision,
+                        numeric_scale,
+                        is_nullable,
+                        column_default,
+                        ordinal_position
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    ORDER BY ordinal_position
+                """, (schema_name, table_name))
+
+                for row in cursor.fetchall():
+                    col_name, data_type, char_len, num_prec, num_scale, is_nullable, col_default, ordinal_pos = row
+
+                    type_detail = data_type
+                    if char_len:
+                        type_detail += f"({char_len})"
+                    elif num_prec:
+                        if num_scale:
+                            type_detail += f"({num_prec},{num_scale})"
+                        else:
+                            type_detail += f"({num_prec})"
+
+                    table_metadata['columns'].append({
+                        'name': col_name,
+                        'type': data_type,
+                        'type_detail': type_detail,
+                        'nullable': is_nullable == 'YES',
+                        'default': col_default,
+                        'position': ordinal_pos
+                    })
+
+                # Busca chaves primárias
+                cursor.execute("""
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    WHERE i.indrelid = %s::regclass AND i.indisprimary
+                    ORDER BY array_position(i.indkey, a.attnum)
+                """, (f'{schema_name}.{table_name}',))
+
+                table_metadata['primary_keys'] = [row[0] for row in cursor.fetchall()]
+
+                # Busca chaves estrangeiras
+                cursor.execute("""
+                    SELECT
+                        tc.constraint_name,
+                        kcu.column_name,
+                        ccu.table_schema AS foreign_schema,
+                        ccu.table_name AS foreign_table,
+                        ccu.column_name AS foreign_column
+                    FROM information_schema.table_constraints AS tc
+                    JOIN information_schema.key_column_usage AS kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                        AND tc.table_schema = kcu.table_schema
+                    JOIN information_schema.constraint_column_usage AS ccu
+                        ON ccu.constraint_name = tc.constraint_name
+                        AND ccu.table_schema = tc.table_schema
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                        AND tc.table_schema = %s
+                        AND tc.table_name = %s
+                """, (schema_name, table_name))
+
+                for row in cursor.fetchall():
+                    constraint_name, column_name, foreign_schema, foreign_table, foreign_column = row
+                    table_metadata['foreign_keys'].append({
+                        'constraint_name': constraint_name,
+                        'column': column_name,
+                        'references_schema': foreign_schema,
+                        'references_table': foreign_table,
+                        'references_column': foreign_column
+                    })
+
+                # Busca índices
+                cursor.execute("""
+                    SELECT
+                        i.relname AS index_name,
+                        a.attname AS column_name,
+                        ix.indisunique AS is_unique,
+                        ix.indisprimary AS is_primary
+                    FROM pg_class t
+                    JOIN pg_index ix ON t.oid = ix.indrelid
+                    JOIN pg_class i ON i.oid = ix.indexrelid
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                    WHERE n.nspname = %s
+                        AND t.relname = %s
+                        AND NOT ix.indisprimary
+                    ORDER BY i.relname, a.attnum
+                """, (schema_name, table_name))
+
+                indexes = {}
+                for row in cursor.fetchall():
+                    index_name, column_name, is_unique, is_primary = row
+                    if index_name not in indexes:
+                        indexes[index_name] = {
+                            'name': index_name,
+                            'columns': [],
+                            'unique': is_unique
+                        }
+                    indexes[index_name]['columns'].append(column_name)
+
+                table_metadata['indexes'] = list(indexes.values())
+
+                # Busca outras constraints (UNIQUE, CHECK)
+                cursor.execute("""
+                    SELECT
+                        tc.constraint_name,
+                        tc.constraint_type,
+                        kcu.column_name
+                    FROM information_schema.table_constraints AS tc
+                    LEFT JOIN information_schema.key_column_usage AS kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                        AND tc.table_schema = kcu.table_schema
+                    WHERE tc.table_schema = %s
+                        AND tc.table_name = %s
+                        AND tc.constraint_type IN ('UNIQUE', 'CHECK')
+                    ORDER BY tc.constraint_name
+                """, (schema_name, table_name))
+
+                constraints = {}
+                for row in cursor.fetchall():
+                    constraint_name, constraint_type, column_name = row
+                    if constraint_name not in constraints:
+                        constraints[constraint_name] = {
+                            'name': constraint_name,
+                            'type': constraint_type,
+                            'columns': []
+                        }
+                    if column_name:
+                        constraints[constraint_name]['columns'].append(column_name)
+
+                table_metadata['constraints'] = list(constraints.values())
+
+                metadata['schemas'][schema_name]['tables'][table_name] = table_metadata
+
+        return metadata
+    finally:
+        if cursor:
+            cursor.close()
 
 def map_postgres_to_prisma_type(pg_type):
     """Mapeia tipos PostgreSQL para tipos Prisma"""
@@ -800,6 +1314,174 @@ def generate():
     finally:
         if conn:
             return_db_connection(conn)
+
+@app.route('/api/data-dictionary/metadata', methods=['POST'])
+def get_data_dictionary_metadata():
+    """Obtém metadados completos dos schemas/tabelas selecionados"""
+    conn = None
+    try:
+        data = request.json
+        selected_schemas = data.get('schemas', [])
+
+        if not selected_schemas:
+            return jsonify({'error': 'Nenhum schema selecionado'}), 400
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Não conectado ao banco de dados'}), 500
+
+        metadata = extract_database_metadata(conn, selected_schemas)
+        return jsonify(metadata)
+
+    except Exception as e:
+        logger.error(f"Erro ao buscar metadados: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.route('/api/data-dictionary/chat', methods=['POST'])
+def chat_data_dictionary():
+    """Endpoint para chat com Grok sobre o dicionário de dados"""
+    conn = None
+    try:
+        if not grok_client:
+            return jsonify({
+                'error': 'Serviço de IA não disponível. Configure XAI_API_KEY no arquivo .env'
+            }), 503
+
+        data = request.json
+        user_message = data.get('message', '').strip()
+        selected_schemas = data.get('schemas', [])
+        conversation_history = data.get('history', [])
+
+        if not user_message:
+            return jsonify({'error': 'Mensagem vazia'}), 400
+
+        if not selected_schemas:
+            return jsonify({'error': 'Nenhum schema selecionado'}), 400
+
+        # Obtém metadados do banco de dados
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Não conectado ao banco de dados'}), 500
+
+        metadata = extract_database_metadata(conn, selected_schemas)
+
+        # Prepara contexto para o Grok
+        context = f"""Você é um especialista em bancos de dados PostgreSQL e está analisando o seguinte banco de dados:
+
+**Banco de Dados:** {metadata['database_name']}
+
+**Estrutura do Banco de Dados:**
+
+"""
+
+        # Adiciona informações detalhadas sobre cada schema/tabela
+        for schema_name, schema_data in metadata['schemas'].items():
+            context += f"\n### Schema: {schema_name}\n\n"
+
+            for table_name, table_data in schema_data['tables'].items():
+                context += f"#### Tabela: {table_name}\n\n"
+
+                # Colunas
+                context += "**Colunas:**\n"
+                for col in table_data['columns']:
+                    nullable = "NULL" if col['nullable'] else "NOT NULL"
+                    default = f", DEFAULT: {col['default']}" if col['default'] else ""
+                    context += f"- `{col['name']}` {col['type_detail']} {nullable}{default}\n"
+
+                # Chave primária
+                if table_data['primary_keys']:
+                    context += f"\n**Chave Primária:** {', '.join(table_data['primary_keys'])}\n"
+
+                # Chaves estrangeiras
+                if table_data['foreign_keys']:
+                    context += "\n**Chaves Estrangeiras:**\n"
+                    for fk in table_data['foreign_keys']:
+                        context += f"- `{fk['column']}` → `{fk['references_schema']}.{fk['references_table']}.{fk['references_column']}`\n"
+
+                # Índices
+                if table_data['indexes']:
+                    context += "\n**Índices:**\n"
+                    for idx in table_data['indexes']:
+                        unique = "UNIQUE" if idx['unique'] else ""
+                        context += f"- {idx['name']} {unique} ({', '.join(idx['columns'])})\n"
+
+                # Constraints
+                if table_data['constraints']:
+                    context += "\n**Constraints:**\n"
+                    for const in table_data['constraints']:
+                        cols = f"({', '.join(const['columns'])})" if const['columns'] else ""
+                        context += f"- {const['name']} ({const['type']}) {cols}\n"
+
+                context += "\n"
+
+        context += """
+
+**Sua tarefa é:**
+1. Analisar a estrutura do banco de dados acima
+2. Explicar o propósito e significado dos schemas, tabelas e campos
+3. Identificar e explicar os relacionamentos entre as tabelas
+4. Sugerir prováveis casos de uso e finalidades do banco de dados
+5. Responder perguntas do usuário sobre a estrutura do banco de dados
+
+**Diretrizes:**
+- Seja claro e didático nas explicações
+- Use exemplos quando apropriado
+- Identifique padrões de design (normalização, denormalização, etc)
+- Sugira melhorias quando relevante
+- Explique em português brasileiro
+"""
+
+        # Monta histórico de mensagens no formato OpenAI
+        messages = [
+            {"role": "system", "content": context}
+        ]
+
+        # Adiciona histórico de conversação se houver
+        for msg in conversation_history:
+            messages.append({
+                "role": msg['role'],
+                "content": msg['content']
+            })
+
+        # Adiciona mensagem atual do usuário
+        messages.append({
+            "role": "user",
+            "content": user_message
+        })
+
+        # Chama a API do Grok (formato OpenAI)
+        response = grok_client.chat.completions.create(
+            model="grok-3",
+            messages=messages,
+            max_tokens=4096,
+            temperature=0.7
+        )
+
+        assistant_message = response.choices[0].message.content
+
+        return jsonify({
+            'message': assistant_message,
+            'model': response.model,
+            'usage': {
+                'input_tokens': response.usage.prompt_tokens,
+                'output_tokens': response.usage.completion_tokens
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Erro no chat: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.route('/favicon.ico')
+def favicon():
+    """Retorna 204 No Content para evitar erro 500 no favicon"""
+    return '', 204
 
 @app.errorhandler(Exception)
 def handle_error(error):
