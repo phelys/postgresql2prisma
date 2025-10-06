@@ -3,6 +3,8 @@ version: '3.8'
 services:
   postgresql2prisma:
     build: .
+    env_file:
+      - .env
     container_name: postgresql2prisma
     ports:
       - "5000:5000"
