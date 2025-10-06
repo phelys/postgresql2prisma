@@ -1101,7 +1101,38 @@ def table_exists(conn, schema_name, table_name):
         if cursor:
             cursor.close()
 
-def map_postgres_to_prisma_type(pg_type):
+def get_schema_enums(conn, schema_name):
+    """Busca todos os ENUMs definidos em um schema do PostgreSQL"""
+    cursor = None
+    try:
+        # Força commit para garantir que vemos o estado atual do banco
+        conn.commit()
+
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                t.typname as enum_name,
+                array_agg(e.enumlabel ORDER BY e.enumsortorder) as enum_values
+            FROM pg_type t
+            JOIN pg_enum e ON t.oid = e.enumtypid
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname = %s
+            GROUP BY t.typname
+            ORDER BY t.typname
+        """, (schema_name,))
+
+        enums = {}
+        for row in cursor.fetchall():
+            enum_name, enum_values = row
+            enums[enum_name] = enum_values
+
+        logger.debug(f"ENUMs encontrados no schema '{schema_name}': {list(enums.keys())}")
+        return enums
+    finally:
+        if cursor:
+            cursor.close()
+
+def map_postgres_to_prisma_type(pg_type, udt_name=None):
     """Mapeia tipos PostgreSQL para tipos Prisma"""
     type_mapping = {
         'integer': 'Int',
@@ -1130,28 +1161,45 @@ def map_postgres_to_prisma_type(pg_type):
         'uuid': 'String',
         'bytea': 'Bytes',
     }
+
+    # Se o tipo é USER-DEFINED (enum), retorna o nome do tipo
+    if pg_type.lower() == 'user-defined' and udt_name:
+        # Converte para PascalCase (padrão Prisma)
+        return ''.join(word.capitalize() for word in udt_name.split('_'))
+
     return type_mapping.get(pg_type.lower(), 'String')
 
-def generate_prisma_schema(schema_name, table_name, conn):
-    """Gera o schema Prisma para uma tabela específica"""
+def generate_prisma_schema(schema_name, table_name, conn, include_enums=True):
+    """Gera o schema Prisma para uma tabela específica
+
+    Args:
+        schema_name: Nome do schema PostgreSQL
+        table_name: Nome da tabela
+        conn: Conexão com o banco
+        include_enums: Se True, inclui definições de enum no output
+    """
     cursor = None
     try:
         cursor = conn.cursor()
-        
-        # Busca colunas da tabela
+
+        # Busca ENUMs do schema
+        enums = get_schema_enums(conn, schema_name)
+
+        # Busca colunas da tabela (incluindo udt_name para enums)
         cursor.execute("""
-            SELECT 
-                column_name, 
-                data_type, 
+            SELECT
+                column_name,
+                data_type,
                 is_nullable,
-                column_default
+                column_default,
+                udt_name
             FROM information_schema.columns
             WHERE table_schema = %s AND table_name = %s
             ORDER BY ordinal_position
         """, (schema_name, table_name))
-        
+
         columns = cursor.fetchall()
-        
+
         # Busca chaves primárias
         cursor.execute("""
             SELECT a.attname
@@ -1159,18 +1207,37 @@ def generate_prisma_schema(schema_name, table_name, conn):
             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
             WHERE i.indrelid = %s::regclass AND i.indisprimary
         """, (f'{schema_name}.{table_name}',))
-        
+
         primary_keys = [row[0] for row in cursor.fetchall()]
-        
+
+        # Identifica quais enums são usados nesta tabela
+        used_enums = set()
+        for col_name, data_type, is_nullable, col_default, udt_name in columns:
+            if data_type.lower() == 'user-defined' and udt_name in enums:
+                used_enums.add(udt_name)
+                logger.debug(f"Coluna '{col_name}' usa ENUM '{udt_name}' em {schema_name}.{table_name}")
+            elif data_type.lower() == 'user-defined':
+                logger.debug(f"Coluna '{col_name}' é USER-DEFINED mas udt_name='{udt_name}' não encontrado nos enums: {list(enums.keys())}")
+
+        # Gera definições de ENUMs usados (se solicitado)
+        prisma_schema = ''
+        if include_enums:
+            for enum_name in sorted(used_enums):
+                enum_prisma_name = ''.join(word.capitalize() for word in enum_name.split('_'))
+                prisma_schema += f'enum {enum_prisma_name} {{\n'
+                for value in enums[enum_name]:
+                    prisma_schema += f'  {value}\n'
+                prisma_schema += '}\n\n'
+
         # Gera o modelo Prisma
         model_name = ''.join(word.capitalize() for word in table_name.split('_'))
-        
-        prisma_schema = f'model {model_name} {{\n'
-        
-        for col_name, data_type, is_nullable, col_default in columns:
-            prisma_type = map_postgres_to_prisma_type(data_type)
+
+        prisma_schema += f'model {model_name} {{\n'
+
+        for col_name, data_type, is_nullable, col_default, udt_name in columns:
+            prisma_type = map_postgres_to_prisma_type(data_type, udt_name)
             optional = '?' if is_nullable == 'YES' and col_name not in primary_keys else ''
-            
+
             attributes = []
             if col_name in primary_keys:
                 attributes.append('@id')
@@ -1179,19 +1246,52 @@ def generate_prisma_schema(schema_name, table_name, conn):
             elif col_default:
                 if 'now()' in str(col_default) or 'CURRENT_TIMESTAMP' in str(col_default):
                     attributes.append('@default(now())')
-            
+
             attr_str = ' ' + ' '.join(attributes) if attributes else ''
             prisma_schema += f'  {col_name} {prisma_type}{optional}{attr_str}\n'
-        
+
         prisma_schema += f'\n  @@map("{table_name}")\n'
         if schema_name != 'public':
             prisma_schema += f'  @@schema("{schema_name}")\n'
         prisma_schema += '}\n'
-        
+
         return prisma_schema
     finally:
         if cursor:
             cursor.close()
+
+def generate_enum_definitions(conn, schemas_list):
+    """Gera todas as definições de ENUMs para uma lista de schemas
+
+    Args:
+        conn: Conexão com o banco
+        schemas_list: Lista de nomes de schemas
+
+    Returns:
+        str: Definições de ENUMs em formato Prisma
+    """
+    all_enums = {}
+
+    # Coleta todos os enums de todos os schemas
+    for schema_name in schemas_list:
+        enums = get_schema_enums(conn, schema_name)
+        for enum_name, enum_values in enums.items():
+            # Usa chave única: schema.enum_name para evitar conflitos
+            key = f"{schema_name}.{enum_name}"
+            if key not in all_enums:
+                all_enums[key] = (enum_name, enum_values)
+
+    # Gera definições
+    prisma_enums = ''
+    for key in sorted(all_enums.keys()):
+        enum_name, enum_values = all_enums[key]
+        enum_prisma_name = ''.join(word.capitalize() for word in enum_name.split('_'))
+        prisma_enums += f'enum {enum_prisma_name} {{\n'
+        for value in enum_values:
+            prisma_enums += f'  {value}\n'
+        prisma_enums += '}\n\n'
+
+    return prisma_enums
 
 @app.route('/')
 def index():
@@ -1520,7 +1620,7 @@ def generate():
         data = request.json
         tables = data['tables']
         mode = data.get('mode', 'multiple')
-        
+
         conn = get_db_connection()
         if not conn:
             return jsonify({'error': 'Não conectado ao banco de dados'}), 500
@@ -1530,10 +1630,52 @@ def generate():
             prisma_content = "// Schema Prisma gerado automaticamente\n"
             prisma_content += f"// Data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
+            # Primeiro passo: identificar todos os ENUMs usados nas tabelas selecionadas
+            all_used_enums = {}
             for item in tables:
                 schema = item['schema']
                 table = item['table']
-                prisma_content += generate_prisma_schema(schema, table, conn)
+
+                # Busca ENUMs do schema
+                schema_enums = get_schema_enums(conn, schema)
+
+                # Busca colunas da tabela para identificar quais enums são usados
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT data_type, udt_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                """, (schema, table))
+
+                for data_type, udt_name in cursor.fetchall():
+                    if data_type.lower() == 'user-defined' and udt_name in schema_enums:
+                        # Usa chave única para evitar duplicação
+                        key = f"{schema}.{udt_name}"
+                        if key not in all_used_enums:
+                            all_used_enums[key] = (udt_name, schema_enums[udt_name])
+                            logger.debug(f"ENUM '{udt_name}' será incluído no schema único")
+                    elif data_type.lower() == 'user-defined':
+                        logger.debug(f"USER-DEFINED tipo '{udt_name}' em {schema}.{table} não encontrado nos enums: {list(schema_enums.keys())}")
+
+                cursor.close()
+
+            # Gera definições de ENUMs usados
+            if all_used_enums:
+                prisma_content += "// Definições de ENUMs\n"
+                for key in sorted(all_used_enums.keys()):
+                    enum_name, enum_values = all_used_enums[key]
+                    enum_prisma_name = ''.join(word.capitalize() for word in enum_name.split('_'))
+                    prisma_content += f'enum {enum_prisma_name} {{\n'
+                    for value in enum_values:
+                        prisma_content += f'  {value}\n'
+                    prisma_content += '}\n\n'
+
+            # Gera os models (sem incluir enums, já foram gerados acima)
+            prisma_content += "// Models\n"
+            for item in tables:
+                schema = item['schema']
+                table = item['table']
+                prisma_content += generate_prisma_schema(schema, table, conn, include_enums=False)
                 prisma_content += "\n"
 
             # Retorna o arquivo único
@@ -1555,7 +1697,8 @@ def generate():
                     schema = item['schema']
                     table = item['table']
 
-                    prisma_content = generate_prisma_schema(schema, table, conn)
+                    # No modo múltiplo, cada arquivo inclui seus próprios enums
+                    prisma_content = generate_prisma_schema(schema, table, conn, include_enums=True)
                     filename_zip = f'{schema}_{table}.prisma'
                     zip_file.writestr(filename_zip, prisma_content)
 
