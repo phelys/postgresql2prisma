@@ -11,6 +11,7 @@ from datetime import datetime
 import logging
 from openai import OpenAI
 from dotenv import load_dotenv
+import requests
 
 # Carrega variáveis de ambiente
 load_dotenv()
@@ -92,13 +93,17 @@ def return_db_connection(conn):
     if connection_pool and conn:
         connection_pool.putconn(conn)
 
-HTML_TEMPLATE = '''
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-BR" class="h-full">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Gerador de Schema Prisma - PostgreSQL</title>
+    <!-- Version 2.0 - GraphQL Explorer with Search -->
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @keyframes spin {
@@ -181,6 +186,10 @@ HTML_TEMPLATE = '''
                             <button onclick="switchTab('dictionary')" id="tabDictionary"
                                     class="tab-button px-6 py-4 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300">
                                 Dicionário de Dados (IA)
+                            </button>
+                            <button onclick="switchTab('graphql')" id="tabGraphQL"
+                                    class="tab-button px-6 py-4 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300">
+                                GraphQL Explorer
                             </button>
                         </nav>
                     </div>
@@ -313,6 +322,89 @@ HTML_TEMPLATE = '''
                     </div>
                 </div>
                 <!-- End Tab Content: Data Dictionary -->
+
+                <!-- Tab Content: GraphQL Explorer -->
+                <div id="contentGraphQL" class="tab-content hidden">
+                    <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+                        <div class="px-6 py-4 border-b border-slate-200">
+                            <h2 class="text-lg font-medium text-slate-900">GraphQL Explorer</h2>
+                            <p class="text-xs text-slate-500 mt-1">Cole a URL do endpoint GraphQL para listar queries e mutations</p>
+                        </div>
+
+                        <div class="p-6">
+                            <!-- URL Input -->
+                            <div class="mb-6">
+                                <label class="block text-sm font-medium text-slate-700 mb-2">URL do Endpoint GraphQL</label>
+                                <div class="flex gap-2">
+                                    <input type="url" id="graphqlUrl" placeholder="https://api.example.com/graphql"
+                                           class="flex-1 px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-transparent"
+                                           onkeypress="if(event.key == 'Enter') introspectGraphQL()">
+                                    <button onclick="introspectGraphQL()"
+                                            class="px-4 py-2 bg-slate-900 text-white text-sm font-medium rounded-md hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:ring-offset-2 transition-colors">
+                                        Analisar
+                                    </button>
+                                </div>
+                                <div id="graphqlStatus" class="mt-2 text-xs"></div>
+                            </div>
+
+                            <!-- Results -->
+                            <div id="graphqlResults" class="hidden">
+                                <!-- Search Filter -->
+                                <div class="mb-6">
+                                    <label class="block text-sm font-medium text-slate-700 mb-2">Buscar por palavra-chave</label>
+                                    <input type="text" id="graphqlSearchInput" placeholder="Digite para filtrar queries, mutations e subscriptions..."
+                                           class="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-transparent"
+                                           onkeyup="if(typeof filterGraphQLOperations === 'function') { filterGraphQLOperations(); }">
+                                </div>
+
+                                <!-- Queries Section -->
+                                <div class="mb-6">
+                                    <div class="flex items-center justify-between mb-3">
+                                        <h3 class="text-base font-medium text-slate-900">Queries</h3>
+                                        <span id="queriesCount" class="text-xs bg-slate-900 text-white px-2 py-1 rounded">0</span>
+                                    </div>
+                                    <div id="queriesList" class="border border-slate-200 rounded-md divide-y divide-slate-200 max-h-96 overflow-y-auto">
+                                        <!-- Queries will be populated here -->
+                                    </div>
+                                </div>
+
+                                <!-- Mutations Section -->
+                                <div class="mb-6">
+                                    <div class="flex items-center justify-between mb-3">
+                                        <h3 class="text-base font-medium text-slate-900">Mutations</h3>
+                                        <span id="mutationsCount" class="text-xs bg-slate-900 text-white px-2 py-1 rounded">0</span>
+                                    </div>
+                                    <div id="mutationsList" class="border border-slate-200 rounded-md divide-y divide-slate-200 max-h-96 overflow-y-auto">
+                                        <!-- Mutations will be populated here -->
+                                    </div>
+                                </div>
+
+                                <!-- Subscriptions Section -->
+                                <div>
+                                    <div class="flex items-center justify-between mb-3">
+                                        <h3 class="text-base font-medium text-slate-900">Subscriptions</h3>
+                                        <span id="subscriptionsCount" class="text-xs bg-slate-900 text-white px-2 py-1 rounded">0</span>
+                                    </div>
+                                    <div id="subscriptionsList" class="border border-slate-200 rounded-md divide-y divide-slate-200 max-h-96 overflow-y-auto">
+                                        <!-- Subscriptions will be populated here -->
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Loading State -->
+                            <div id="graphqlLoading" class="hidden text-center py-12">
+                                <div class="spinner mx-auto mb-3"></div>
+                                <p class="text-sm text-slate-500">Analisando endpoint GraphQL...</p>
+                            </div>
+
+                            <!-- Empty State -->
+                            <div id="graphqlEmpty" class="text-center py-12 border border-slate-200 rounded-md bg-slate-50">
+                                <p class="text-sm text-slate-400">Cole a URL do endpoint GraphQL e clique em "Analisar"</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- End Tab Content: GraphQL Explorer -->
             </div>
         </div>
     </div>
@@ -636,9 +728,12 @@ HTML_TEMPLATE = '''
             if (tabName === 'schemas') {
                 document.getElementById('tabSchemas').classList.add('active', 'border-slate-900', 'text-slate-900');
                 document.getElementById('tabSchemas').classList.remove('border-transparent', 'text-slate-500');
-            } else {
+            } else if (tabName === 'dictionary') {
                 document.getElementById('tabDictionary').classList.add('active', 'border-slate-900', 'text-slate-900');
                 document.getElementById('tabDictionary').classList.remove('border-transparent', 'text-slate-500');
+            } else if (tabName === 'graphql') {
+                document.getElementById('tabGraphQL').classList.add('active', 'border-slate-900', 'text-slate-900');
+                document.getElementById('tabGraphQL').classList.remove('border-transparent', 'text-slate-500');
             }
 
             // Update tab content
@@ -648,9 +743,11 @@ HTML_TEMPLATE = '''
 
             if (tabName === 'schemas') {
                 document.getElementById('contentSchemas').classList.remove('hidden');
-            } else {
+            } else if (tabName === 'dictionary') {
                 document.getElementById('contentDictionary').classList.remove('hidden');
                 loadSchemasForDictionary();
+            } else if (tabName === 'graphql') {
+                document.getElementById('contentGraphQL').classList.remove('hidden');
             }
         }
 
@@ -824,10 +921,290 @@ HTML_TEMPLATE = '''
 
             return formatted;
         }
+
+        // ===== GRAPHQL EXPLORER FUNCTIONS =====
+
+        let graphqlData = {
+            queries: [],
+            mutations: [],
+            subscriptions: []
+        };
+
+        async function introspectGraphQL() {
+            const urlInput = document.getElementById('graphqlUrl');
+            const url = urlInput.value.trim();
+            const statusDiv = document.getElementById('graphqlStatus');
+            const loadingDiv = document.getElementById('graphqlLoading');
+            const emptyDiv = document.getElementById('graphqlEmpty');
+            const resultsDiv = document.getElementById('graphqlResults');
+
+            if (!url) {
+                statusDiv.textContent = 'Por favor, insira uma URL válida';
+                statusDiv.className = 'mt-2 text-xs text-red-600';
+                return;
+            }
+
+            // Show loading state
+            loadingDiv.classList.remove('hidden');
+            emptyDiv.classList.add('hidden');
+            resultsDiv.classList.add('hidden');
+            statusDiv.textContent = '';
+
+            try {
+                const response = await fetch('/api/graphql/introspect', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url: url})
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    displayGraphQLResults(data);
+                    statusDiv.textContent = 'Análise concluída com sucesso';
+                    statusDiv.className = 'mt-2 text-xs text-green-600';
+                } else {
+                    statusDiv.textContent = 'Erro: ' + data.error;
+                    statusDiv.className = 'mt-2 text-xs text-red-600';
+                    loadingDiv.classList.add('hidden');
+                    emptyDiv.classList.remove('hidden');
+                }
+            } catch (error) {
+                statusDiv.textContent = 'Erro de conexão: ' + error.message;
+                statusDiv.className = 'mt-2 text-xs text-red-600';
+                loadingDiv.classList.add('hidden');
+                emptyDiv.classList.remove('hidden');
+            }
+        }
+
+        function displayGraphQLResults(data) {
+            const loadingDiv = document.getElementById('graphqlLoading');
+            const resultsDiv = document.getElementById('graphqlResults');
+            const queriesList = document.getElementById('queriesList');
+            const mutationsList = document.getElementById('mutationsList');
+            const subscriptionsList = document.getElementById('subscriptionsList');
+            const queriesCount = document.getElementById('queriesCount');
+            const mutationsCount = document.getElementById('mutationsCount');
+            const subscriptionsCount = document.getElementById('subscriptionsCount');
+
+            // Store data globally for filtering
+            graphqlData = data;
+
+            // Clear search input
+            document.getElementById('graphqlSearchInput').value = '';
+
+            // Hide loading, show results
+            loadingDiv.classList.add('hidden');
+            resultsDiv.classList.remove('hidden');
+
+            // Display queries
+            queriesCount.textContent = data.queries.length;
+            queriesList.innerHTML = '';
+            if (data.queries.length === 0) {
+                queriesList.innerHTML = '<div class="p-4 text-sm text-slate-400 text-center">Nenhuma query encontrada</div>';
+            } else {
+                data.queries.forEach(query => {
+                    const queryDiv = document.createElement('div');
+                    queryDiv.className = 'graphql-operation-item p-4 hover:bg-slate-50 transition-colors';
+                    queryDiv.setAttribute('data-name', query.name.toLowerCase());
+                    queryDiv.setAttribute('data-description', (query.description || '').toLowerCase());
+                    queryDiv.setAttribute('data-type', 'query');
+                    queryDiv.innerHTML = `
+                        <div class="flex items-start justify-between">
+                            <div class="flex-1">
+                                <h4 class="font-mono text-sm font-medium text-slate-900">${escapeHtml(query.name)}</h4>
+                                ${query.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(query.description)}</p>` : ''}
+                                ${query.args && query.args.length > 0 ? `
+                                    <div class="mt-2">
+                                        <p class="text-xs font-medium text-slate-600">Argumentos:</p>
+                                        <ul class="mt-1 space-y-1">
+                                            ${query.args.map(arg => `
+                                                <li class="text-xs text-slate-600">
+                                                    <span class="font-mono">${escapeHtml(arg.name)}</span>:
+                                                    <span class="text-slate-500">${escapeHtml(arg.type)}</span>
+                                                </li>
+                                            `).join('')}
+                                        </ul>
+                                    </div>
+                                ` : ''}
+                            </div>
+                            <div class="ml-4">
+                                <span class="text-xs font-mono text-slate-500">${escapeHtml(query.type)}</span>
+                            </div>
+                        </div>
+                    `;
+                    queriesList.appendChild(queryDiv);
+                });
+            }
+
+            // Display mutations
+            mutationsCount.textContent = data.mutations.length;
+            mutationsList.innerHTML = '';
+            if (data.mutations.length === 0) {
+                mutationsList.innerHTML = '<div class="p-4 text-sm text-slate-400 text-center">Nenhuma mutation encontrada</div>';
+            } else {
+                data.mutations.forEach(mutation => {
+                    const mutationDiv = document.createElement('div');
+                    mutationDiv.className = 'graphql-operation-item p-4 hover:bg-slate-50 transition-colors';
+                    mutationDiv.setAttribute('data-name', mutation.name.toLowerCase());
+                    mutationDiv.setAttribute('data-description', (mutation.description || '').toLowerCase());
+                    mutationDiv.setAttribute('data-type', 'mutation');
+                    mutationDiv.innerHTML = `
+                        <div class="flex items-start justify-between">
+                            <div class="flex-1">
+                                <h4 class="font-mono text-sm font-medium text-slate-900">${escapeHtml(mutation.name)}</h4>
+                                ${mutation.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(mutation.description)}</p>` : ''}
+                                ${mutation.args && mutation.args.length > 0 ? `
+                                    <div class="mt-2">
+                                        <p class="text-xs font-medium text-slate-600">Argumentos:</p>
+                                        <ul class="mt-1 space-y-1">
+                                            ${mutation.args.map(arg => `
+                                                <li class="text-xs text-slate-600">
+                                                    <span class="font-mono">${escapeHtml(arg.name)}</span>:
+                                                    <span class="text-slate-500">${escapeHtml(arg.type)}</span>
+                                                </li>
+                                            `).join('')}
+                                        </ul>
+                                    </div>
+                                ` : ''}
+                            </div>
+                            <div class="ml-4">
+                                <span class="text-xs font-mono text-slate-500">${escapeHtml(mutation.type)}</span>
+                            </div>
+                        </div>
+                    `;
+                    mutationsList.appendChild(mutationDiv);
+                });
+            }
+
+            // Display subscriptions
+            subscriptionsCount.textContent = data.subscriptions.length;
+            subscriptionsList.innerHTML = '';
+            if (data.subscriptions.length === 0) {
+                subscriptionsList.innerHTML = '<div class="p-4 text-sm text-slate-400 text-center">Nenhuma subscription encontrada</div>';
+            } else {
+                data.subscriptions.forEach(subscription => {
+                    const subscriptionDiv = document.createElement('div');
+                    subscriptionDiv.className = 'graphql-operation-item p-4 hover:bg-slate-50 transition-colors';
+                    subscriptionDiv.setAttribute('data-name', subscription.name.toLowerCase());
+                    subscriptionDiv.setAttribute('data-description', (subscription.description || '').toLowerCase());
+                    subscriptionDiv.setAttribute('data-type', 'subscription');
+                    subscriptionDiv.innerHTML = `
+                        <div class="flex items-start justify-between">
+                            <div class="flex-1">
+                                <h4 class="font-mono text-sm font-medium text-slate-900">${escapeHtml(subscription.name)}</h4>
+                                ${subscription.description ? `<p class="text-xs text-slate-500 mt-1">${escapeHtml(subscription.description)}</p>` : ''}
+                                ${subscription.args && subscription.args.length > 0 ? `
+                                    <div class="mt-2">
+                                        <p class="text-xs font-medium text-slate-600">Argumentos:</p>
+                                        <ul class="mt-1 space-y-1">
+                                            ${subscription.args.map(arg => `
+                                                <li class="text-xs text-slate-600">
+                                                    <span class="font-mono">${escapeHtml(arg.name)}</span>:
+                                                    <span class="text-slate-500">${escapeHtml(arg.type)}</span>
+                                                </li>
+                                            `).join('')}
+                                        </ul>
+                                    </div>
+                                ` : ''}
+                            </div>
+                            <div class="ml-4">
+                                <span class="text-xs font-mono text-slate-500">${escapeHtml(subscription.type)}</span>
+                            </div>
+                        </div>
+                    `;
+                    subscriptionsList.appendChild(subscriptionDiv);
+                });
+            }
+        }
+
+        function filterGraphQLOperations() {
+            const searchInput = document.getElementById('graphqlSearchInput');
+            const searchTerm = searchInput.value.toLowerCase().trim();
+
+            // Get all operation items
+            const allOperations = document.querySelectorAll('.graphql-operation-item');
+
+            let visibleQueries = 0;
+            let visibleMutations = 0;
+            let visibleSubscriptions = 0;
+
+            allOperations.forEach(item => {
+                const name = item.getAttribute('data-name');
+                const description = item.getAttribute('data-description');
+                const type = item.getAttribute('data-type');
+
+                // Check if search term matches name or description
+                const matches = searchTerm === '' ||
+                               name.includes(searchTerm) ||
+                               description.includes(searchTerm);
+
+                if (matches) {
+                    item.style.display = '';
+
+                    // Count visible items by type
+                    if (type === 'query') visibleQueries++;
+                    else if (type === 'mutation') visibleMutations++;
+                    else if (type === 'subscription') visibleSubscriptions++;
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+
+            // Update counters
+            const queriesCount = document.getElementById('queriesCount');
+            const mutationsCount = document.getElementById('mutationsCount');
+            const subscriptionsCount = document.getElementById('subscriptionsCount');
+
+            queriesCount.textContent = searchTerm === '' ? graphqlData.queries.length : visibleQueries;
+            mutationsCount.textContent = searchTerm === '' ? graphqlData.mutations.length : visibleMutations;
+            subscriptionsCount.textContent = searchTerm === '' ? graphqlData.subscriptions.length : visibleSubscriptions;
+
+            // Show "no results" message if needed
+            const queriesList = document.getElementById('queriesList');
+            const mutationsList = document.getElementById('mutationsList');
+            const subscriptionsList = document.getElementById('subscriptionsList');
+
+            if (visibleQueries === 0 && queriesList.querySelectorAll('.graphql-operation-item').length > 0) {
+                if (!queriesList.querySelector('.no-results-message')) {
+                    const noResults = document.createElement('div');
+                    noResults.className = 'no-results-message p-4 text-sm text-slate-400 text-center';
+                    noResults.textContent = 'Nenhuma query encontrada com esse filtro';
+                    queriesList.appendChild(noResults);
+                }
+            } else {
+                const noResults = queriesList.querySelector('.no-results-message');
+                if (noResults) noResults.remove();
+            }
+
+            if (visibleMutations === 0 && mutationsList.querySelectorAll('.graphql-operation-item').length > 0) {
+                if (!mutationsList.querySelector('.no-results-message')) {
+                    const noResults = document.createElement('div');
+                    noResults.className = 'no-results-message p-4 text-sm text-slate-400 text-center';
+                    noResults.textContent = 'Nenhuma mutation encontrada com esse filtro';
+                    mutationsList.appendChild(noResults);
+                }
+            } else {
+                const noResults = mutationsList.querySelector('.no-results-message');
+                if (noResults) noResults.remove();
+            }
+
+            if (visibleSubscriptions === 0 && subscriptionsList.querySelectorAll('.graphql-operation-item').length > 0) {
+                if (!subscriptionsList.querySelector('.no-results-message')) {
+                    const noResults = document.createElement('div');
+                    noResults.className = 'no-results-message p-4 text-sm text-slate-400 text-center';
+                    noResults.textContent = 'Nenhuma subscription encontrada com esse filtro';
+                    subscriptionsList.appendChild(noResults);
+                }
+            } else {
+                const noResults = subscriptionsList.querySelector('.no-results-message');
+                if (noResults) noResults.remove();
+            }
+        }
     </script>
 </body>
 </html>
-'''
+"""
 
 def extract_database_metadata(conn, selected_schemas=None):
     """
@@ -1881,6 +2258,172 @@ def chat_data_dictionary():
     finally:
         if conn:
             return_db_connection(conn)
+
+@app.route('/api/graphql/introspect', methods=['POST'])
+def introspect_graphql():
+    """Faz introspection em um endpoint GraphQL e retorna queries e mutations"""
+    try:
+        data = request.json
+        graphql_url = data.get('url', '').strip()
+
+        if not graphql_url:
+            return jsonify({'error': 'URL não fornecida'}), 400
+
+        # Introspection query padrão do GraphQL
+        introspection_query = """
+        query IntrospectionQuery {
+            __schema {
+                queryType { name }
+                mutationType { name }
+                subscriptionType { name }
+                types {
+                    name
+                    kind
+                    description
+                    fields(includeDeprecated: false) {
+                        name
+                        description
+                        args {
+                            name
+                            description
+                            type {
+                                name
+                                kind
+                                ofType {
+                                    name
+                                    kind
+                                    ofType {
+                                        name
+                                        kind
+                                        ofType {
+                                            name
+                                            kind
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        type {
+                            name
+                            kind
+                            ofType {
+                                name
+                                kind
+                                ofType {
+                                    name
+                                    kind
+                                    ofType {
+                                        name
+                                        kind
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+        # Faz a requisição para o endpoint GraphQL
+        response = requests.post(
+            graphql_url,
+            json={'query': introspection_query},
+            headers={'Content-Type': 'application/json'},
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            return jsonify({
+                'error': f'Erro ao conectar com o endpoint GraphQL: HTTP {response.status_code}'
+            }), 400
+
+        introspection_data = response.json()
+
+        if 'errors' in introspection_data:
+            errors = introspection_data['errors']
+            error_messages = [err.get('message', str(err)) for err in errors]
+            return jsonify({
+                'error': f'Erro na introspection: {", ".join(error_messages)}'
+            }), 400
+
+        schema_data = introspection_data.get('data', {}).get('__schema', {})
+
+        if not schema_data:
+            return jsonify({'error': 'Schema vazio ou inválido'}), 400
+
+        # Extrai os tipos Query, Mutation e Subscription
+        query_type_name = schema_data.get('queryType', {}).get('name') if schema_data.get('queryType') else None
+        mutation_type_name = schema_data.get('mutationType', {}).get('name') if schema_data.get('mutationType') else None
+        subscription_type_name = schema_data.get('subscriptionType', {}).get('name') if schema_data.get('subscriptionType') else None
+
+        types = schema_data.get('types', [])
+
+        def format_type(type_obj):
+            """Formata recursivamente um tipo GraphQL para string legível"""
+            if not type_obj:
+                return 'Unknown'
+
+            kind = type_obj.get('kind')
+            name = type_obj.get('name')
+            of_type = type_obj.get('ofType')
+
+            if kind == 'NON_NULL':
+                return f'{format_type(of_type)}!'
+            elif kind == 'LIST':
+                return f'[{format_type(of_type)}]'
+            elif name:
+                return name
+            elif of_type:
+                return format_type(of_type)
+            else:
+                return 'Unknown'
+
+        def extract_fields(type_name):
+            """Extrai campos de um tipo específico"""
+            if not type_name:
+                return []
+
+            for t in types:
+                if t.get('name') == type_name:
+                    fields = t.get('fields', [])
+                    result = []
+                    for field in fields:
+                        args = []
+                        for arg in field.get('args', []):
+                            args.append({
+                                'name': arg.get('name'),
+                                'type': format_type(arg.get('type')),
+                                'description': arg.get('description')
+                            })
+
+                        result.append({
+                            'name': field.get('name'),
+                            'description': field.get('description'),
+                            'type': format_type(field.get('type')),
+                            'args': args
+                        })
+                    return result
+            return []
+
+        queries = extract_fields(query_type_name)
+        mutations = extract_fields(mutation_type_name)
+        subscriptions = extract_fields(subscription_type_name)
+
+        return jsonify({
+            'queries': queries,
+            'mutations': mutations,
+            'subscriptions': subscriptions
+        })
+
+    except requests.exceptions.Timeout:
+        return jsonify({'error': 'Timeout ao conectar com o endpoint GraphQL'}), 408
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erro ao fazer requisição GraphQL: {e}")
+        return jsonify({'error': f'Erro de conexão: {str(e)}'}), 500
+    except Exception as e:
+        logger.error(f"Erro ao fazer introspection GraphQL: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/favicon.ico')
 def favicon():
