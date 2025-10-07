@@ -76,6 +76,7 @@ def get_db_connection():
     if connection_pool:
         try:
             conn = connection_pool.getconn()
+            conn.autocommit = True  # Garante que cada query veja o estado mais recente do banco
             # Testa se a conexão está ativa
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
