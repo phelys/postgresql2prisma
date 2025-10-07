@@ -1236,7 +1236,10 @@ def generate_prisma_schema(schema_name, table_name, conn, include_enums=True):
 
         for col_name, data_type, is_nullable, col_default, udt_name in columns:
             prisma_type = map_postgres_to_prisma_type(data_type, udt_name)
-            optional = '?' if is_nullable == 'YES' and col_name not in primary_keys else ''
+
+            # Campos que devem ser sempre opcionais
+            always_optional_fields = ['deleted_at', 'deletedAt', 'updated_at', 'updatedAt', 'createdBy', 'deletedBy']
+            optional = '?' if (is_nullable == 'YES' and col_name not in primary_keys) or col_name in always_optional_fields else ''
 
             attributes = []
             if col_name in primary_keys:
