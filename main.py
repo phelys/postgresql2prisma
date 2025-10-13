@@ -554,18 +554,80 @@ HTML_TEMPLATE = """
                 info.innerHTML = `<div class="inline-flex items-center px-3 py-1.5 bg-slate-900 text-white text-sm rounded-md">${count} tabela(s) selecionada(s)</div>`;
                 document.getElementById('generateSection').classList.remove('hidden');
 
-                if (event && event.target && event.target.checked) {
-                    const checkboxId = event.target.id;
-                    const parts = checkboxId.replace('cb-', '').split('-');
-                    const schema = parts[0];
-                    const table = parts.slice(1).join('-');
-                    await showTableDetails(schema, table);
-                }
+                // Sempre mostrar detalhes de todas as tabelas selecionadas
+                await showAllSelectedTableDetails();
             } else {
                 info.innerHTML = '';
                 document.getElementById('generateSection').classList.add('hidden');
                 const detailsContent = document.getElementById('tableDetailsContent');
                 detailsContent.innerHTML = '<p class="text-center text-sm text-slate-400 py-12">Selecione uma tabela para ver os detalhes</p>';
+            }
+        }
+
+        async function showAllSelectedTableDetails() {
+            const detailsContent = document.getElementById('tableDetailsContent');
+            detailsContent.innerHTML = '<div class="text-center py-8"><div class="spinner mx-auto mb-2"></div><p class="text-sm text-slate-500">Carregando...</p></div>';
+
+            try {
+                // Coletar todas as tabelas selecionadas
+                const checkboxes = document.querySelectorAll('input[type="checkbox"]:checked');
+                const selected = [];
+
+                checkboxes.forEach(cb => {
+                    const parts = cb.id.replace('cb-', '').split('-');
+                    selected.push({
+                        schema: parts[0],
+                        table: parts.slice(1).join('-')
+                    });
+                });
+
+                if (selected.length === 0) {
+                    detailsContent.innerHTML = '<p class="text-center text-sm text-slate-400 py-12">Selecione uma tabela para ver os detalhes</p>';
+                    return;
+                }
+
+                // Buscar detalhes de todas as tabelas
+                const response = await fetch('/multiple-table-details', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({tables: selected})
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    detailsContent.innerHTML = `<p class="text-sm text-red-600">Erro: ${data.error}</p>`;
+                    return;
+                }
+
+                // Construir HTML com todas as tabelas
+                let html = `
+                    <div class="mb-4 p-3 bg-slate-50 rounded-md border border-slate-200 text-sm">
+                        <span class="font-medium text-slate-700">Database:</span> <span class="text-slate-600">${data.database}</span> |
+                        <span class="font-medium text-slate-700">Total de tabelas:</span> <span class="text-slate-600">${data.tables.length}</span>
+                    </div>
+                `;
+
+                // Adicionar cada tabela
+                data.tables.forEach((table, index) => {
+                    html += `
+                        <div class="mb-4 ${index > 0 ? 'mt-6 pt-4 border-t border-slate-200' : ''}">
+                            <div class="mb-3 p-2 bg-blue-50 rounded-md border border-blue-200 text-sm">
+                                <span class="font-medium text-blue-700">Schema:</span> <span class="text-blue-600">${table.schema}</span> |
+                                <span class="font-medium text-blue-700">Tabela:</span> <span class="text-blue-600">${table.table}</span> |
+                                <span class="font-medium text-blue-700">FDW:</span> <span class="text-blue-600">${table.fdw}</span>
+                            </div>
+                            <div>
+                                <div class="text-sm font-medium text-slate-700 mb-2">DDL:</div>
+                                <div class="bg-slate-900 text-slate-50 p-4 rounded-md font-mono text-xs overflow-x-auto max-h-96 overflow-y-auto">${table.ddl}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                detailsContent.innerHTML = html;
+            } catch (error) {
+                detailsContent.innerHTML = `<p class="text-sm text-red-600">Erro ao carregar detalhes: ${error.message}</p>`;
             }
         }
 
@@ -1864,6 +1926,121 @@ def table_details():
         })
     except Exception as e:
         logger.error(f"Erro ao buscar detalhes da tabela: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+@app.route('/multiple-table-details', methods=['POST'])
+def multiple_table_details():
+    """Retorna detalhes de múltiplas tabelas selecionadas"""
+    conn = None
+    try:
+        data = request.json
+        tables = data.get('tables', [])  # Lista de {schema: 'nome', table: 'nome'}
+
+        if not tables:
+            return jsonify({'error': 'Nenhuma tabela selecionada'}), 400
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Não conectado ao banco de dados'}), 500
+
+        cursor = conn.cursor()
+
+        # Busca o nome do banco de dados
+        cursor.execute("SELECT current_database()")
+        database_name = cursor.fetchone()[0]
+
+        result_tables = []
+
+        for table_info in tables:
+            schema_name = table_info['schema']
+            table_name = table_info['table']
+
+            # Verifica se é Foreign Data Wrapper
+            cursor.execute("""
+                SELECT c.relkind
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = %s
+            """, (schema_name, table_name))
+
+            result = cursor.fetchone()
+            is_fdw = 'Sim' if result and result[0] == 'f' else 'Não'
+
+            # Busca colunas da tabela
+            cursor.execute("""
+                SELECT
+                    column_name,
+                    data_type,
+                    character_maximum_length,
+                    numeric_precision,
+                    numeric_scale,
+                    is_nullable,
+                    column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (schema_name, table_name))
+
+            columns = cursor.fetchall()
+
+            # Busca constraints (chave primária)
+            cursor.execute("""
+                SELECT a.attname
+                FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                WHERE i.indrelid = %s::regclass AND i.indisprimary
+            """, (f'{schema_name}.{table_name}',))
+
+            primary_keys = [row[0] for row in cursor.fetchall()]
+
+            # Gera DDL
+            ddl = f"CREATE TABLE {schema_name}.{table_name} (\n"
+            col_defs = []
+
+            for col_name, data_type, char_len, num_prec, num_scale, is_nullable, col_default in columns:
+                col_def = f"  {col_name} {data_type.upper()}"
+
+                if char_len:
+                    col_def += f"({char_len})"
+                elif num_prec:
+                    if num_scale:
+                        col_def += f"({num_prec},{num_scale})"
+                    else:
+                        col_def += f"({num_prec})"
+
+                if is_nullable == 'NO':
+                    col_def += " NOT NULL"
+
+                if col_default:
+                    col_def += f" DEFAULT {col_default}"
+
+                col_defs.append(col_def)
+
+            if primary_keys:
+                pk_str = ", ".join(primary_keys)
+                col_defs.append(f"  PRIMARY KEY ({pk_str})")
+
+            ddl += ",\n".join(col_defs)
+            ddl += "\n);"
+
+            result_tables.append({
+                'schema': schema_name,
+                'table': table_name,
+                'fdw': is_fdw,
+                'ddl': ddl
+            })
+
+        cursor.close()
+
+        return jsonify({
+            'database': database_name,
+            'tables': result_tables
+        })
+    except Exception as e:
+        logger.error(f"Erro ao buscar detalhes de múltiplas tabelas: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         if conn:
