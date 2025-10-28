@@ -516,13 +516,22 @@ HTML_TEMPLATE = """
                 tablesList.id = `tables-${schema}`;
 
                 tables.forEach(table => {
+                    // Suporta tanto o formato antigo (string) quanto o novo (objeto)
+                    const tableName = typeof table === 'string' ? table : table.name;
+                    const isFdw = typeof table === 'object' && table.is_fdw;
+
                     const tableItem = document.createElement('div');
                     tableItem.className = 'flex items-center gap-2 px-3 py-2 bg-white border border-slate-200 rounded-md hover:bg-slate-50 transition-colors';
+
+                    const fdwBadge = isFdw ? '<span class="ml-1 text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded border border-blue-300">FDW</span>' : '';
+
                     tableItem.innerHTML = `
-                        <input type="checkbox" id="cb-${schema}-${table}"
+                        <input type="checkbox" id="cb-${schema}-${tableName}"
                                onchange="updateSelection(event)"
                                class="w-4 h-4 text-slate-900 border-slate-300 rounded focus:ring-slate-900">
-                        <label for="cb-${schema}-${table}" class="text-sm text-slate-700 cursor-pointer flex-1">📄 ${table}</label>
+                        <label for="cb-${schema}-${tableName}" class="text-sm text-slate-700 cursor-pointer flex-1 flex items-center">
+                            📄 ${tableName}${fdwBadge}
+                        </label>
                     `;
                     tablesList.appendChild(tableItem);
                 });
@@ -1297,16 +1306,19 @@ def extract_database_metadata(conn, selected_schemas=None):
         schema_filter = ""
         if selected_schemas:
             schema_placeholders = ','.join(['%s'] * len(selected_schemas))
-            schema_filter = f"AND table_schema IN ({schema_placeholders})"
+            schema_filter = f"AND n.nspname IN ({schema_placeholders})"
 
-        # Busca todas as tabelas dos schemas selecionados
+        # Busca todas as tabelas dos schemas selecionados (incluindo FDW)
+        # Usa pg_class para garantir que tabelas FDW sejam capturadas
         query = f"""
-            SELECT DISTINCT table_schema
-            FROM information_schema.tables
-            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-              AND table_type = 'BASE TABLE'
+            SELECT DISTINCT n.nspname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'f')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname !~ '^pg_toast'
               {schema_filter}
-            ORDER BY table_schema
+            ORDER BY n.nspname
         """
 
         if selected_schemas:
@@ -1319,12 +1331,15 @@ def extract_database_metadata(conn, selected_schemas=None):
         for schema_name in schemas:
             metadata['schemas'][schema_name] = {'tables': {}}
 
-            # Busca tabelas do schema
+            # Busca tabelas do schema (incluindo FDW)
+            # Usa pg_class para garantir que tabelas FDW sejam capturadas
             cursor.execute("""
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema = %s AND table_type = 'BASE TABLE'
-                ORDER BY table_name
+                SELECT c.relname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s
+                  AND c.relkind IN ('r', 'f')
+                ORDER BY c.relname
             """, (schema_name,))
 
             tables = [row[0] for row in cursor.fetchall()]
@@ -1338,51 +1353,97 @@ def extract_database_metadata(conn, selected_schemas=None):
                     'constraints': []
                 }
 
-                # Busca colunas
+                # Busca OID e tipo da tabela (para suportar FDW)
                 cursor.execute("""
-                    SELECT
-                        column_name,
-                        data_type,
-                        character_maximum_length,
-                        numeric_precision,
-                        numeric_scale,
-                        is_nullable,
-                        column_default,
-                        ordinal_position
-                    FROM information_schema.columns
-                    WHERE table_schema = %s AND table_name = %s
-                    ORDER BY ordinal_position
+                    SELECT c.oid, c.relkind
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s AND c.relname = %s
                 """, (schema_name, table_name))
+
+                table_info = cursor.fetchone()
+                if not table_info:
+                    continue
+                table_oid, relkind = table_info
+                is_fdw = relkind == 'f'
+
+                # Busca colunas (FDW requer abordagem diferente)
+                if is_fdw:
+                    cursor.execute("""
+                        SELECT
+                            a.attname as column_name,
+                            pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+                            CASE
+                                WHEN a.atttypid = ANY ('{1043,1042}'::oid[]) THEN a.atttypmod - 4
+                                ELSE NULL
+                            END as character_maximum_length,
+                            CASE
+                                WHEN a.atttypid = ANY ('{1700}'::oid[]) THEN ((a.atttypmod - 4) >> 16) & 65535
+                                ELSE NULL
+                            END as numeric_precision,
+                            CASE
+                                WHEN a.atttypid = ANY ('{1700}'::oid[]) THEN (a.atttypmod - 4) & 65535
+                                ELSE NULL
+                            END as numeric_scale,
+                            CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END as is_nullable,
+                            pg_get_expr(d.adbin, d.adrelid) as column_default,
+                            a.attnum as ordinal_position
+                        FROM pg_catalog.pg_attribute a
+                        LEFT JOIN pg_catalog.pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum)
+                        WHERE a.attrelid = %s
+                            AND a.attnum > 0
+                            AND NOT a.attisdropped
+                        ORDER BY a.attnum
+                    """, (table_oid,))
+                else:
+                    cursor.execute("""
+                        SELECT
+                            column_name,
+                            data_type,
+                            character_maximum_length,
+                            numeric_precision,
+                            numeric_scale,
+                            is_nullable,
+                            column_default,
+                            ordinal_position
+                        FROM information_schema.columns
+                        WHERE table_schema = %s AND table_name = %s
+                        ORDER BY ordinal_position
+                    """, (schema_name, table_name))
 
                 for row in cursor.fetchall():
                     col_name, data_type, char_len, num_prec, num_scale, is_nullable, col_default, ordinal_pos = row
 
-                    type_detail = data_type
-                    if char_len:
-                        type_detail += f"({char_len})"
-                    elif num_prec:
-                        if num_scale:
-                            type_detail += f"({num_prec},{num_scale})"
-                        else:
-                            type_detail += f"({num_prec})"
+                    # Para FDW, data_type já vem formatado
+                    if is_fdw:
+                        type_detail = data_type
+                    else:
+                        type_detail = data_type
+                        if char_len:
+                            type_detail += f"({char_len})"
+                        elif num_prec:
+                            if num_scale:
+                                type_detail += f"({num_prec},{num_scale})"
+                            else:
+                                type_detail += f"({num_prec})"
 
                     table_metadata['columns'].append({
                         'name': col_name,
-                        'type': data_type,
+                        'type': data_type.split('(')[0] if is_fdw else data_type,  # Remove tamanho para FDW
                         'type_detail': type_detail,
                         'nullable': is_nullable == 'YES',
                         'default': col_default,
                         'position': ordinal_pos
                     })
 
-                # Busca chaves primárias
+                # Busca chaves primárias usando OID
                 cursor.execute("""
                     SELECT a.attname
                     FROM pg_index i
                     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                    WHERE i.indrelid = %s::regclass AND i.indisprimary
+                    WHERE i.indrelid = %s AND i.indisprimary
                     ORDER BY array_position(i.indkey, a.attnum)
-                """, (f'{schema_name}.{table_name}',))
+                """, (table_oid,))
 
                 table_metadata['primary_keys'] = [row[0] for row in cursor.fetchall()]
 
@@ -1625,28 +1686,59 @@ def generate_prisma_schema(schema_name, table_name, conn, include_enums=True):
         # Busca ENUMs do schema
         enums = get_schema_enums(conn, schema_name)
 
-        # Busca colunas da tabela (incluindo udt_name para enums)
+        # Busca OID e tipo da tabela (para suportar FDW)
         cursor.execute("""
-            SELECT
-                column_name,
-                data_type,
-                is_nullable,
-                column_default,
-                udt_name
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-            ORDER BY ordinal_position
+            SELECT c.oid, c.relkind
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s
         """, (schema_name, table_name))
+
+        table_info = cursor.fetchone()
+        if not table_info:
+            raise ValueError(f'Tabela {schema_name}.{table_name} não encontrada')
+        table_oid, relkind = table_info
+        is_fdw = relkind == 'f'
+
+        # Busca colunas da tabela (FDW requer abordagem diferente)
+        if is_fdw:
+            cursor.execute("""
+                SELECT
+                    a.attname as column_name,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+                    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END as is_nullable,
+                    pg_get_expr(d.adbin, d.adrelid) as column_default,
+                    t.typname as udt_name
+                FROM pg_catalog.pg_attribute a
+                LEFT JOIN pg_catalog.pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum)
+                LEFT JOIN pg_catalog.pg_type t ON a.atttypid = t.oid
+                WHERE a.attrelid = %s
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+                ORDER BY a.attnum
+            """, (table_oid,))
+        else:
+            cursor.execute("""
+                SELECT
+                    column_name,
+                    data_type,
+                    is_nullable,
+                    column_default,
+                    udt_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (schema_name, table_name))
 
         columns = cursor.fetchall()
 
-        # Busca chaves primárias
+        # Busca chaves primárias usando OID
         cursor.execute("""
             SELECT a.attname
             FROM pg_index i
             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-            WHERE i.indrelid = %s::regclass AND i.indisprimary
-        """, (f'{schema_name}.{table_name}',))
+            WHERE i.indrelid = %s AND i.indisprimary
+        """, (table_oid,))
 
         primary_keys = [row[0] for row in cursor.fetchall()]
 
@@ -1802,24 +1894,37 @@ def get_schemas():
 
         cursor = conn.cursor()
 
+        # Busca tabelas locais (BASE TABLE) e tabelas FDW (FOREIGN TABLE)
+        # Usa pg_class para garantir que tabelas FDW sejam capturadas corretamente
         cursor.execute("""
             SELECT
-                table_schema,
-                table_name
-            FROM information_schema.tables
-            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-              AND table_type = 'BASE TABLE'
-              AND table_name !~ '(_p|p_|_)[0-9]+$'
-            ORDER BY table_schema, table_name
+                n.nspname as table_schema,
+                c.relname as table_name,
+                CASE
+                    WHEN c.relkind = 'r' THEN 'BASE TABLE'
+                    WHEN c.relkind = 'f' THEN 'FOREIGN TABLE'
+                END as table_type
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'f')  -- r = tabela regular, f = tabela foreign (FDW)
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND n.nspname !~ '^pg_toast'
+              AND c.relname !~ '(_p|p_|_)[0-9]+$'
+            ORDER BY n.nspname, c.relname
         """)
 
         results = cursor.fetchall()
         schemas = {}
 
-        for schema, table in results:
+        for schema, table, table_type in results:
             if schema not in schemas:
                 schemas[schema] = []
-            schemas[schema].append(table)
+            # Adiciona indicador se é tabela FDW
+            table_info = {
+                'name': table,
+                'is_fdw': table_type == 'FOREIGN TABLE'
+            }
+            schemas[schema].append(table_info)
 
         cursor.close()
         return_db_connection(conn)
@@ -1847,41 +1952,73 @@ def table_details():
         cursor.execute("SELECT current_database()")
         database_name = cursor.fetchone()[0]
 
-        # Verifica se é Foreign Data Wrapper
+        # Verifica se é Foreign Data Wrapper e busca o OID da tabela
         cursor.execute("""
-            SELECT c.relkind
+            SELECT c.relkind, c.oid
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = %s AND c.relname = %s
         """, (schema_name, table_name))
 
         result = cursor.fetchone()
-        is_fdw = 'Sim' if result and result[0] == 'f' else 'Não'
+        if not result:
+            return jsonify({'error': f'Tabela {schema_name}.{table_name} não encontrada'}), 404
+
+        is_fdw = 'Sim' if result[0] == 'f' else 'Não'
+        table_oid = result[1]
 
         # Gera DDL da tabela
-        cursor.execute("""
-            SELECT
-                column_name,
-                data_type,
-                character_maximum_length,
-                numeric_precision,
-                numeric_scale,
-                is_nullable,
-                column_default
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-            ORDER BY ordinal_position
-        """, (schema_name, table_name))
+        # Para FDW, usa pg_attribute diretamente pois information_schema pode não ter os dados
+        if is_fdw == 'Sim':
+            cursor.execute("""
+                SELECT
+                    a.attname as column_name,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+                    CASE
+                        WHEN a.atttypid = ANY ('{1043,1042}'::oid[]) THEN a.atttypmod - 4
+                        ELSE NULL
+                    END as character_maximum_length,
+                    CASE
+                        WHEN a.atttypid = ANY ('{1700}'::oid[]) THEN ((a.atttypmod - 4) >> 16) & 65535
+                        ELSE NULL
+                    END as numeric_precision,
+                    CASE
+                        WHEN a.atttypid = ANY ('{1700}'::oid[]) THEN (a.atttypmod - 4) & 65535
+                        ELSE NULL
+                    END as numeric_scale,
+                    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END as is_nullable,
+                    pg_get_expr(d.adbin, d.adrelid) as column_default
+                FROM pg_catalog.pg_attribute a
+                LEFT JOIN pg_catalog.pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum)
+                WHERE a.attrelid = %s
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+                ORDER BY a.attnum
+            """, (table_oid,))
+        else:
+            cursor.execute("""
+                SELECT
+                    column_name,
+                    data_type,
+                    character_maximum_length,
+                    numeric_precision,
+                    numeric_scale,
+                    is_nullable,
+                    column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (schema_name, table_name))
 
         columns = cursor.fetchall()
 
-        # Busca constraints (chave primária)
+        # Busca constraints (chave primária) usando o OID da tabela
         cursor.execute("""
             SELECT a.attname
             FROM pg_index i
             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-            WHERE i.indrelid = %s::regclass AND i.indisprimary
-        """, (f'{schema_name}.{table_name}',))
+            WHERE i.indrelid = %s AND i.indisprimary
+        """, (table_oid,))
 
         primary_keys = [row[0] for row in cursor.fetchall()]
 
@@ -1890,15 +2027,19 @@ def table_details():
         col_defs = []
 
         for col_name, data_type, char_len, num_prec, num_scale, is_nullable, col_default in columns:
-            col_def = f"  {col_name} {data_type.upper()}"
+            # Para FDW, o data_type já vem formatado com tamanho (ex: "character varying(255)")
+            if is_fdw == 'Sim':
+                col_def = f"  {col_name} {data_type}"
+            else:
+                col_def = f"  {col_name} {data_type.upper()}"
 
-            if char_len:
-                col_def += f"({char_len})"
-            elif num_prec:
-                if num_scale:
-                    col_def += f"({num_prec},{num_scale})"
-                else:
-                    col_def += f"({num_prec})"
+                if char_len:
+                    col_def += f"({char_len})"
+                elif num_prec:
+                    if num_scale:
+                        col_def += f"({num_prec},{num_scale})"
+                    else:
+                        col_def += f"({num_prec})"
 
             if is_nullable == 'NO':
                 col_def += " NOT NULL"
@@ -1958,41 +2099,72 @@ def multiple_table_details():
             schema_name = table_info['schema']
             table_name = table_info['table']
 
-            # Verifica se é Foreign Data Wrapper
+            # Verifica se é Foreign Data Wrapper e busca o OID
             cursor.execute("""
-                SELECT c.relkind
+                SELECT c.relkind, c.oid
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname = %s AND c.relname = %s
             """, (schema_name, table_name))
 
             result = cursor.fetchone()
-            is_fdw = 'Sim' if result and result[0] == 'f' else 'Não'
+            if not result:
+                continue  # Pula tabelas não encontradas
 
-            # Busca colunas da tabela
-            cursor.execute("""
-                SELECT
-                    column_name,
-                    data_type,
-                    character_maximum_length,
-                    numeric_precision,
-                    numeric_scale,
-                    is_nullable,
-                    column_default
-                FROM information_schema.columns
-                WHERE table_schema = %s AND table_name = %s
-                ORDER BY ordinal_position
-            """, (schema_name, table_name))
+            is_fdw = 'Sim' if result[0] == 'f' else 'Não'
+            table_oid = result[1]
+
+            # Busca colunas da tabela (FDW requer abordagem diferente)
+            if is_fdw == 'Sim':
+                cursor.execute("""
+                    SELECT
+                        a.attname as column_name,
+                        pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+                        CASE
+                            WHEN a.atttypid = ANY ('{1043,1042}'::oid[]) THEN a.atttypmod - 4
+                            ELSE NULL
+                        END as character_maximum_length,
+                        CASE
+                            WHEN a.atttypid = ANY ('{1700}'::oid[]) THEN ((a.atttypmod - 4) >> 16) & 65535
+                            ELSE NULL
+                        END as numeric_precision,
+                        CASE
+                            WHEN a.atttypid = ANY ('{1700}'::oid[]) THEN (a.atttypmod - 4) & 65535
+                            ELSE NULL
+                        END as numeric_scale,
+                        CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END as is_nullable,
+                        pg_get_expr(d.adbin, d.adrelid) as column_default
+                    FROM pg_catalog.pg_attribute a
+                    LEFT JOIN pg_catalog.pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum)
+                    WHERE a.attrelid = %s
+                        AND a.attnum > 0
+                        AND NOT a.attisdropped
+                    ORDER BY a.attnum
+                """, (table_oid,))
+            else:
+                cursor.execute("""
+                    SELECT
+                        column_name,
+                        data_type,
+                        character_maximum_length,
+                        numeric_precision,
+                        numeric_scale,
+                        is_nullable,
+                        column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    ORDER BY ordinal_position
+                """, (schema_name, table_name))
 
             columns = cursor.fetchall()
 
-            # Busca constraints (chave primária)
+            # Busca constraints (chave primária) usando OID
             cursor.execute("""
                 SELECT a.attname
                 FROM pg_index i
                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                WHERE i.indrelid = %s::regclass AND i.indisprimary
-            """, (f'{schema_name}.{table_name}',))
+                WHERE i.indrelid = %s AND i.indisprimary
+            """, (table_oid,))
 
             primary_keys = [row[0] for row in cursor.fetchall()]
 
@@ -2001,15 +2173,19 @@ def multiple_table_details():
             col_defs = []
 
             for col_name, data_type, char_len, num_prec, num_scale, is_nullable, col_default in columns:
-                col_def = f"  {col_name} {data_type.upper()}"
+                # Para FDW, o data_type já vem formatado com tamanho
+                if is_fdw == 'Sim':
+                    col_def = f"  {col_name} {data_type}"
+                else:
+                    col_def = f"  {col_name} {data_type.upper()}"
 
-                if char_len:
-                    col_def += f"({char_len})"
-                elif num_prec:
-                    if num_scale:
-                        col_def += f"({num_prec},{num_scale})"
-                    else:
-                        col_def += f"({num_prec})"
+                    if char_len:
+                        col_def += f"({char_len})"
+                    elif num_prec:
+                        if num_scale:
+                            col_def += f"({num_prec},{num_scale})"
+                        else:
+                            col_def += f"({num_prec})"
 
                 if is_nullable == 'NO':
                     col_def += " NOT NULL"
@@ -2073,15 +2249,17 @@ def search():
             schema_name = parts[0].strip()
             table_name = parts[1].strip()
 
-            # Busca exata
+            # Busca exata (incluindo FDW)
             cursor.execute("""
-                SELECT table_schema, table_name
-                FROM information_schema.tables
-                WHERE table_schema = %s
-                  AND table_name = %s
-                  AND table_type = 'BASE TABLE'
-                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
-                  AND table_name !~ '(_p|p_|_)[0-9]+$'
+                SELECT n.nspname, c.relname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s
+                  AND c.relname = %s
+                  AND c.relkind IN ('r', 'f')
+                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                  AND n.nspname !~ '^pg_toast'
+                  AND c.relname !~ '(_p|p_|_)[0-9]+$'
             """, (schema_name, table_name))
 
             exact_match = cursor.fetchone()
@@ -2092,16 +2270,18 @@ def search():
                     'table': exact_match[1]
                 })
             else:
-                # Busca parcial no schema especificado
+                # Busca parcial no schema especificado (incluindo FDW)
                 cursor.execute("""
-                    SELECT table_schema, table_name
-                    FROM information_schema.tables
-                    WHERE table_schema = %s
-                      AND table_name ILIKE %s
-                      AND table_type = 'BASE TABLE'
-                      AND table_schema NOT IN ('pg_catalog', 'information_schema')
-                      AND table_name !~ '(_p|p_|_)[0-9]+$'
-                    ORDER BY table_name
+                    SELECT n.nspname, c.relname
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s
+                      AND c.relname ILIKE %s
+                      AND c.relkind IN ('r', 'f')
+                      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                      AND n.nspname !~ '^pg_toast'
+                      AND c.relname !~ '(_p|p_|_)[0-9]+$'
+                    ORDER BY c.relname
                 """, (schema_name, f'%{table_name}%'))
 
                 for row in cursor.fetchall():
@@ -2110,13 +2290,14 @@ def search():
                         'table': row[1]
                     })
         else:
-            # Primeiro tenta como schema
+            # Primeiro tenta como schema (incluindo FDW)
             if schema_exists(conn, query):
                 cursor.execute("""
                     SELECT COUNT(*)
-                    FROM information_schema.tables
-                    WHERE table_schema = %s
-                      AND table_type = 'BASE TABLE'
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s
+                      AND c.relkind IN ('r', 'f')
                 """, (query,))
                 table_count = cursor.fetchone()[0]
 
@@ -2124,15 +2305,17 @@ def search():
                 result_data['schema'] = query
                 result_data['table_count'] = table_count
 
-            # Busca exata de tabelas em todos os schemas
+            # Busca exata de tabelas em todos os schemas (incluindo FDW)
             cursor.execute("""
-                SELECT table_schema, table_name
-                FROM information_schema.tables
-                WHERE table_name = %s
-                  AND table_type = 'BASE TABLE'
-                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
-                  AND table_name !~ '(_p|p_|_)[0-9]+$'
-                ORDER BY table_schema, table_name
+                SELECT n.nspname, c.relname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relname = %s
+                  AND c.relkind IN ('r', 'f')
+                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                  AND n.nspname !~ '^pg_toast'
+                  AND c.relname !~ '(_p|p_|_)[0-9]+$'
+                ORDER BY n.nspname, c.relname
             """, (query,))
 
             exact_matches = cursor.fetchall()
@@ -2142,16 +2325,18 @@ def search():
                     'table': row[1]
                 })
 
-            # Se não encontrou nada exato, busca parcial
+            # Se não encontrou nada exato, busca parcial (incluindo FDW)
             if not result_data['schema_found'] and len(result_data['tables']) == 0:
                 cursor.execute("""
-                    SELECT table_schema, table_name
-                    FROM information_schema.tables
-                    WHERE table_name ILIKE %s
-                      AND table_type = 'BASE TABLE'
-                      AND table_schema NOT IN ('pg_catalog', 'information_schema')
-                      AND table_name !~ '(_p|p_|_)[0-9]+$'
-                    ORDER BY table_schema, table_name
+                    SELECT n.nspname, c.relname
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relname ILIKE %s
+                      AND c.relkind IN ('r', 'f')
+                      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                      AND n.nspname !~ '^pg_toast'
+                      AND c.relname !~ '(_p|p_|_)[0-9]+$'
+                    ORDER BY n.nspname, c.relname
                     LIMIT 50
                 """, (f'%{query}%',))
 
