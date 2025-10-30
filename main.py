@@ -28,6 +28,7 @@ connection_pool = None
 
 # Arquivo para persistir configurações
 CONFIG_FILE = 'db_config.json'
+MICROSERVICES_FILE = 'microservices_mapping.json'
 
 # Cliente Grok (xAI) para integração com IA
 grok_client = None
@@ -68,6 +69,26 @@ def save_config(config):
         return True
     except Exception as e:
         logger.error(f"Erro ao salvar configuração: {e}")
+        return False
+
+def load_microservices_mapping():
+    """Carrega mapeamento de schemas para microserviços"""
+    if os.path.exists(MICROSERVICES_FILE):
+        try:
+            with open(MICROSERVICES_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Erro ao carregar mapeamento de microserviços: {e}")
+    return {}
+
+def save_microservices_mapping(mapping):
+    """Salva mapeamento de schemas para microserviços"""
+    try:
+        with open(MICROSERVICES_FILE, 'w') as f:
+            json.dump(mapping, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao salvar mapeamento de microserviços: {e}")
         return False
 
 def get_db_connection():
@@ -191,6 +212,14 @@ HTML_TEMPLATE = """
                             <button onclick="switchTab('graphql')" id="tabGraphQL"
                                     class="tab-button px-6 py-4 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300">
                                 GraphQL Explorer
+                            </button>
+                            <button onclick="switchTab('microservices')" id="tabMicroservices"
+                                    class="tab-button px-6 py-4 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300">
+                                Microserviços
+                            </button>
+                            <button onclick="switchTab('graphql-beauty')" id="tabGraphQLBeauty"
+                                    class="tab-button px-6 py-4 text-sm font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300">
+                                GraphQL Beauty
                             </button>
                         </nav>
                     </div>
@@ -406,6 +435,138 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
                 <!-- End Tab Content: GraphQL Explorer -->
+
+                <!-- Tab Content: GraphQL Beauty -->
+                <div id="contentGraphQLBeauty" class="tab-content hidden">
+                    <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+                        <div class="px-6 py-4 border-b border-slate-200">
+                            <h2 class="text-lg font-medium text-slate-900">GraphQL Beauty</h2>
+                            <p class="text-xs text-slate-500 mt-1">Cole um GraphQL desformatado para formatar a query e variables</p>
+                        </div>
+
+                        <div class="p-6">
+                            <!-- Input Area -->
+                            <div class="mb-6">
+                                <label class="block text-sm font-medium text-slate-700 mb-2">GraphQL Desformatado (JSON)</label>
+                                <textarea id="graphqlBeautyInput" rows="10" placeholder='Cole aqui o JSON com query e variables, exemplo:
+{
+    "query": "\n    query GetUsers {\n  users {\n    id\n    name\n  }\n}\n",
+    "variables": {"page": 1},
+    "operationName": "GetUsers"
+}'
+                                          class="w-full px-3 py-2 border border-slate-300 rounded-md text-sm font-mono focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-transparent"></textarea>
+                                <div class="mt-3 flex gap-2">
+                                    <button onclick="formatGraphQL()"
+                                            class="px-4 py-2 bg-slate-900 text-white text-sm font-medium rounded-md hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:ring-offset-2 transition-colors">
+                                        Formatar
+                                    </button>
+                                    <button onclick="clearGraphQLBeauty()"
+                                            class="px-4 py-2 bg-slate-200 text-slate-700 text-sm font-medium rounded-md hover:bg-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-2 transition-colors">
+                                        Limpar
+                                    </button>
+                                </div>
+                                <div id="graphqlBeautyStatus" class="mt-2 text-xs"></div>
+                            </div>
+
+                            <!-- Output Area -->
+                            <div id="graphqlBeautyOutput" class="hidden">
+                                <!-- Formatted Query -->
+                                <div class="mb-6">
+                                    <div class="flex items-center justify-between mb-2">
+                                        <label class="block text-sm font-medium text-slate-700">Query Formatada</label>
+                                        <button onclick="copyToClipboard('graphqlBeautyQuery')"
+                                                class="px-3 py-1 text-xs bg-slate-100 text-slate-700 rounded hover:bg-slate-200 transition-colors">
+                                            Copiar
+                                        </button>
+                                    </div>
+                                    <pre id="graphqlBeautyQuery" class="bg-slate-50 border border-slate-200 rounded-md p-4 text-sm font-mono overflow-x-auto max-h-96 overflow-y-auto"></pre>
+                                </div>
+
+                                <!-- Formatted Variables -->
+                                <div class="mb-6">
+                                    <div class="flex items-center justify-between mb-2">
+                                        <label class="block text-sm font-medium text-slate-700">Variables Formatadas</label>
+                                        <button onclick="copyToClipboard('graphqlBeautyVariables')"
+                                                class="px-3 py-1 text-xs bg-slate-100 text-slate-700 rounded hover:bg-slate-200 transition-colors">
+                                            Copiar
+                                        </button>
+                                    </div>
+                                    <pre id="graphqlBeautyVariables" class="bg-slate-50 border border-slate-200 rounded-md p-4 text-sm font-mono overflow-x-auto max-h-96 overflow-y-auto"></pre>
+                                </div>
+
+                                <!-- Operation Name (if exists) -->
+                                <div id="graphqlBeautyOperationNameContainer" class="hidden mb-6">
+                                    <div class="flex items-center justify-between mb-2">
+                                        <label class="block text-sm font-medium text-slate-700">Operation Name</label>
+                                        <button onclick="copyToClipboard('graphqlBeautyOperationName')"
+                                                class="px-3 py-1 text-xs bg-slate-100 text-slate-700 rounded hover:bg-slate-200 transition-colors">
+                                            Copiar
+                                        </button>
+                                    </div>
+                                    <pre id="graphqlBeautyOperationName" class="bg-slate-50 border border-slate-200 rounded-md p-4 text-sm font-mono overflow-x-auto"></pre>
+                                </div>
+                            </div>
+
+                            <!-- Loading State -->
+                            <div id="graphqlBeautyLoading" class="hidden text-center py-8">
+                                <div class="spinner mx-auto mb-3"></div>
+                                <p class="text-sm text-slate-500">Formatando GraphQL...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- End Tab Content: GraphQL Beauty -->
+
+                <!-- Tab Content: Microservices -->
+                <div id="contentMicroservices" class="tab-content hidden">
+                    <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+                        <div class="px-6 py-4 border-b border-slate-200">
+                            <h2 class="text-lg font-medium text-slate-900">Configurar Microserviços</h2>
+                            <p class="text-xs text-slate-500 mt-1">Mapeie schemas para seus microserviços para melhor organização</p>
+                        </div>
+
+                        <div class="p-6">
+                            <!-- Loading State -->
+                            <div id="microservicesLoading" class="text-center py-8">
+                                <div class="spinner mx-auto mb-3"></div>
+                                <p class="text-sm text-slate-500">Carregando schemas...</p>
+                            </div>
+
+                            <!-- Mapping Form -->
+                            <div id="microservicesForm" class="hidden">
+                                <div class="mb-6">
+                                    <p class="text-sm text-slate-600 mb-4">Configure qual microserviço é responsável por cada schema do banco de dados. Esta informação será exibida no Dicionário de Dados (IA).</p>
+                                </div>
+
+                                <div id="microservicesMappings" class="space-y-4 mb-6">
+                                    <!-- Mappings will be dynamically added here -->
+                                </div>
+
+                                <div class="flex gap-3">
+                                    <button onclick="saveMicroservicesMapping()"
+                                            class="px-4 py-2 bg-slate-900 text-white text-sm font-medium rounded-md hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:ring-offset-2 transition-colors">
+                                        Salvar Configuração
+                                    </button>
+                                    <button onclick="clearMicroservicesMapping()"
+                                            class="px-4 py-2 bg-slate-200 text-slate-700 text-sm font-medium rounded-md hover:bg-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-2 transition-colors">
+                                        Limpar Tudo
+                                    </button>
+                                </div>
+
+                                <div id="microservicesStatus" class="mt-4 text-sm"></div>
+                            </div>
+
+                            <!-- Empty State -->
+                            <div id="microservicesEmpty" class="hidden text-center py-12">
+                                <svg class="mx-auto h-12 w-12 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+                                </svg>
+                                <p class="mt-4 text-sm text-slate-500">Conecte-se ao banco de dados primeiro para configurar microserviços</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- End Tab Content: Microservices -->
             </div>
         </div>
     </div>
@@ -806,6 +967,14 @@ HTML_TEMPLATE = """
             } else if (tabName === 'graphql') {
                 document.getElementById('tabGraphQL').classList.add('active', 'border-slate-900', 'text-slate-900');
                 document.getElementById('tabGraphQL').classList.remove('border-transparent', 'text-slate-500');
+            } else if (tabName === 'graphql-beauty') {
+                document.getElementById('tabGraphQLBeauty').classList.add('active', 'border-slate-900', 'text-slate-900');
+                document.getElementById('tabGraphQLBeauty').classList.remove('border-transparent', 'text-slate-500');
+            } else if (tabName === 'microservices') {
+                document.getElementById('tabMicroservices').classList.add('active', 'border-slate-900', 'text-slate-900');
+                document.getElementById('tabMicroservices').classList.remove('border-transparent', 'text-slate-500');
+                // Carrega dados de microserviços quando a tab é aberta
+                loadMicroservicesTab();
             }
 
             // Update tab content
@@ -820,6 +989,10 @@ HTML_TEMPLATE = """
                 loadSchemasForDictionary();
             } else if (tabName === 'graphql') {
                 document.getElementById('contentGraphQL').classList.remove('hidden');
+            } else if (tabName === 'graphql-beauty') {
+                document.getElementById('contentGraphQLBeauty').classList.remove('hidden');
+            } else if (tabName === 'microservices') {
+                document.getElementById('contentMicroservices').classList.remove('hidden');
             }
         }
 
@@ -1273,6 +1446,233 @@ HTML_TEMPLATE = """
                 if (noResults) noResults.remove();
             }
         }
+
+        // GraphQL Beauty Functions
+        async function formatGraphQL() {
+            const input = document.getElementById('graphqlBeautyInput').value.trim();
+            const statusDiv = document.getElementById('graphqlBeautyStatus');
+            const loadingDiv = document.getElementById('graphqlBeautyLoading');
+            const outputDiv = document.getElementById('graphqlBeautyOutput');
+
+            if (!input) {
+                statusDiv.textContent = 'Por favor, cole um JSON com a query GraphQL';
+                statusDiv.className = 'mt-2 text-xs text-red-600';
+                return;
+            }
+
+            // Show loading state
+            loadingDiv.classList.remove('hidden');
+            outputDiv.classList.add('hidden');
+            statusDiv.textContent = '';
+
+            try {
+                const response = await fetch('/api/graphql/format', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({graphql: input})
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    // Display formatted query
+                    document.getElementById('graphqlBeautyQuery').textContent = data.query;
+
+                    // Display formatted variables
+                    document.getElementById('graphqlBeautyVariables').textContent = data.variables;
+
+                    // Display operation name if exists
+                    if (data.operationName) {
+                        document.getElementById('graphqlBeautyOperationName').textContent = data.operationName;
+                        document.getElementById('graphqlBeautyOperationNameContainer').classList.remove('hidden');
+                    } else {
+                        document.getElementById('graphqlBeautyOperationNameContainer').classList.add('hidden');
+                    }
+
+                    loadingDiv.classList.add('hidden');
+                    outputDiv.classList.remove('hidden');
+                    statusDiv.textContent = 'GraphQL formatado com sucesso!';
+                    statusDiv.className = 'mt-2 text-xs text-green-600';
+                } else {
+                    statusDiv.textContent = 'Erro: ' + data.error;
+                    statusDiv.className = 'mt-2 text-xs text-red-600';
+                    loadingDiv.classList.add('hidden');
+                }
+            } catch (error) {
+                statusDiv.textContent = 'Erro ao formatar: ' + error.message;
+                statusDiv.className = 'mt-2 text-xs text-red-600';
+                loadingDiv.classList.add('hidden');
+            }
+        }
+
+        function clearGraphQLBeauty() {
+            document.getElementById('graphqlBeautyInput').value = '';
+            document.getElementById('graphqlBeautyStatus').textContent = '';
+            document.getElementById('graphqlBeautyOutput').classList.add('hidden');
+            document.getElementById('graphqlBeautyLoading').classList.add('hidden');
+        }
+
+        function copyToClipboard(elementId) {
+            const element = document.getElementById(elementId);
+            const text = element.textContent;
+
+            navigator.clipboard.writeText(text).then(() => {
+                // Show temporary feedback
+                const button = event.target;
+                const originalText = button.textContent;
+                button.textContent = 'Copiado!';
+                button.classList.add('bg-green-100', 'text-green-700');
+                button.classList.remove('bg-slate-100', 'text-slate-700');
+
+                setTimeout(() => {
+                    button.textContent = originalText;
+                    button.classList.remove('bg-green-100', 'text-green-700');
+                    button.classList.add('bg-slate-100', 'text-slate-700');
+                }, 2000);
+            }).catch(err => {
+                console.error('Erro ao copiar:', err);
+            });
+        }
+
+        // Microservices Tab Functions
+        async function loadMicroservicesTab() {
+            const loadingEl = document.getElementById('microservicesLoading');
+            const formEl = document.getElementById('microservicesForm');
+            const emptyEl = document.getElementById('microservicesEmpty');
+
+            // Se não há schemas carregados, mostra empty state
+            if (!schemasData || Object.keys(schemasData).length === 0) {
+                loadingEl.classList.add('hidden');
+                formEl.classList.add('hidden');
+                emptyEl.classList.remove('hidden');
+                return;
+            }
+
+            // Mostra loading
+            loadingEl.classList.remove('hidden');
+            formEl.classList.add('hidden');
+            emptyEl.classList.add('hidden');
+
+            try {
+                // Busca mapeamento existente
+                const response = await fetch('/api/microservices/mapping');
+                const data = await response.json();
+                const mapping = data.mapping || {};
+
+                // Renderiza formulário
+                renderMicroservicesMappings(mapping);
+
+                loadingEl.classList.add('hidden');
+                formEl.classList.remove('hidden');
+            } catch (error) {
+                console.error('Erro ao carregar mapeamentos:', error);
+                loadingEl.classList.add('hidden');
+                emptyEl.classList.remove('hidden');
+            }
+        }
+
+        function renderMicroservicesMappings(mapping) {
+            const container = document.getElementById('microservicesMappings');
+            container.innerHTML = '';
+
+            const schemas = Object.keys(schemasData).sort();
+
+            schemas.forEach(schema => {
+                const value = mapping[schema] || '';
+
+                const div = document.createElement('div');
+                div.className = 'flex items-center gap-4';
+
+                div.innerHTML = `
+                    <div class="flex-1">
+                        <label class="block text-sm font-medium text-slate-700 mb-1">Schema: ${schema}</label>
+                        <input type="text"
+                               id="microservice_${schema}"
+                               value="${value}"
+                               placeholder="Nome do microserviço (ex: auth-service, user-service)"
+                               class="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-transparent">
+                    </div>
+                    <div class="flex items-end pb-2">
+                        <button onclick="clearSchemaMapping('${schema}')"
+                                class="px-3 py-2 text-sm text-slate-600 hover:text-slate-900 transition-colors">
+                            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </div>
+                `;
+
+                container.appendChild(div);
+            });
+        }
+
+        function clearSchemaMapping(schema) {
+            const input = document.getElementById(`microservice_${schema}`);
+            if (input) {
+                input.value = '';
+            }
+        }
+
+        async function saveMicroservicesMapping() {
+            const statusEl = document.getElementById('microservicesStatus');
+            statusEl.textContent = 'Salvando...';
+            statusEl.className = 'mt-4 text-sm text-blue-600';
+
+            try {
+                const mapping = {};
+                const schemas = Object.keys(schemasData);
+
+                schemas.forEach(schema => {
+                    const input = document.getElementById(`microservice_${schema}`);
+                    if (input && input.value.trim()) {
+                        mapping[schema] = input.value.trim();
+                    }
+                });
+
+                const response = await fetch('/api/microservices/mapping', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ mapping })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    statusEl.textContent = '✓ Configuração salva com sucesso!';
+                    statusEl.className = 'mt-4 text-sm text-green-600';
+                } else {
+                    throw new Error(data.error || 'Erro ao salvar');
+                }
+            } catch (error) {
+                statusEl.textContent = `✗ Erro: ${error.message}`;
+                statusEl.className = 'mt-4 text-sm text-red-600';
+            }
+
+            setTimeout(() => {
+                statusEl.textContent = '';
+            }, 3000);
+        }
+
+        async function clearMicroservicesMapping() {
+            if (!confirm('Tem certeza que deseja limpar todos os mapeamentos?')) {
+                return;
+            }
+
+            const schemas = Object.keys(schemasData);
+            schemas.forEach(schema => {
+                clearSchemaMapping(schema);
+            });
+
+            const statusEl = document.getElementById('microservicesStatus');
+            statusEl.textContent = 'Campos limpos. Clique em "Salvar Configuração" para persistir.';
+            statusEl.className = 'mt-4 text-sm text-slate-600';
+
+            setTimeout(() => {
+                statusEl.textContent = '';
+            }, 3000);
+        }
     </script>
 </body>
 </html>
@@ -1293,6 +1693,10 @@ def extract_database_metadata(conn, selected_schemas=None):
     cursor = None
     try:
         cursor = conn.cursor()
+
+        # Carrega mapeamento de microserviços
+        microservices_mapping = load_microservices_mapping()
+
         metadata = {
             'database_name': '',
             'schemas': {}
@@ -1329,7 +1733,12 @@ def extract_database_metadata(conn, selected_schemas=None):
         schemas = [row[0] for row in cursor.fetchall()]
 
         for schema_name in schemas:
-            metadata['schemas'][schema_name] = {'tables': {}}
+            # Adiciona informação de microserviço para o schema
+            microservice = microservices_mapping.get(schema_name, None)
+            metadata['schemas'][schema_name] = {
+                'microservice': microservice,
+                'tables': {}
+            }
 
             # Busca tabelas do schema (incluindo FDW)
             # Usa pg_class para garantir que tabelas FDW sejam capturadas
@@ -2523,7 +2932,8 @@ def chat_data_dictionary():
 
         # Adiciona informações detalhadas sobre cada schema/tabela
         for schema_name, schema_data in metadata['schemas'].items():
-            context += f"\n### Schema: {schema_name}\n\n"
+            microservice_info = f" (Microserviço: **{schema_data['microservice']}**)" if schema_data.get('microservice') else ""
+            context += f"\n### Schema: {schema_name}{microservice_info}\n\n"
 
             for table_name, table_data in schema_data['tables'].items():
                 context += f"#### Tabela: {table_name}\n\n"
@@ -2621,6 +3031,37 @@ def chat_data_dictionary():
     finally:
         if conn:
             return_db_connection(conn)
+
+@app.route('/api/microservices/mapping', methods=['GET'])
+def get_microservices_mapping():
+    """Retorna o mapeamento atual de schemas para microserviços"""
+    try:
+        mapping = load_microservices_mapping()
+        return jsonify({'mapping': mapping})
+    except Exception as e:
+        logger.error(f"Erro ao carregar mapeamento: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/microservices/mapping', methods=['POST'])
+def save_microservices_mapping_endpoint():
+    """Salva o mapeamento de schemas para microserviços"""
+    try:
+        data = request.json
+        mapping = data.get('mapping', {})
+
+        if not isinstance(mapping, dict):
+            return jsonify({'error': 'Formato de mapeamento inválido'}), 400
+
+        success = save_microservices_mapping(mapping)
+
+        if success:
+            return jsonify({'success': True, 'message': 'Mapeamento salvo com sucesso'})
+        else:
+            return jsonify({'error': 'Erro ao salvar mapeamento'}), 500
+
+    except Exception as e:
+        logger.error(f"Erro ao salvar mapeamento: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/graphql/introspect', methods=['POST'])
 def introspect_graphql():
@@ -2787,6 +3228,122 @@ def introspect_graphql():
     except Exception as e:
         logger.error(f"Erro ao fazer introspection GraphQL: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/graphql/format', methods=['POST'])
+def format_graphql():
+    """Formata uma query GraphQL desformatada (com \\n) em formato legível"""
+    try:
+        data = request.json
+        graphql_input = data.get('graphql', '').strip()
+
+        if not graphql_input:
+            return jsonify({'error': 'Nenhum conteúdo GraphQL fornecido'}), 400
+
+        # Parse o JSON de entrada
+        try:
+            graphql_data = json.loads(graphql_input)
+        except json.JSONDecodeError as e:
+            return jsonify({'error': f'JSON inválido: {str(e)}'}), 400
+
+        # Extrai a query
+        query = graphql_data.get('query', '')
+        if not query:
+            return jsonify({'error': 'Campo "query" não encontrado no JSON'}), 400
+
+        # Remove os \n e espaços extras da query
+        query = query.strip()
+
+        # Formata a query GraphQL com indentação adequada
+        formatted_query = format_graphql_query(query)
+
+        # Formata as variables
+        variables = graphql_data.get('variables', {})
+        formatted_variables = json.dumps(variables, indent=2, ensure_ascii=False)
+
+        # Extrai o operation name se existir
+        operation_name = graphql_data.get('operationName', '')
+
+        response_data = {
+            'query': formatted_query,
+            'variables': formatted_variables
+        }
+
+        if operation_name:
+            response_data['operationName'] = operation_name
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        logger.error(f"Erro ao formatar GraphQL: {e}")
+        return jsonify({'error': str(e)}), 500
+
+def format_graphql_query(query):
+    """
+    Formata uma query GraphQL removendo \\n e adicionando indentação adequada.
+    """
+    # Remove \n e normaliza espaços
+    query = query.replace('\\n', '\n')
+
+    # Remove múltiplos espaços e quebras de linha
+    lines = [line.strip() for line in query.split('\n') if line.strip()]
+    query = ' '.join(lines)
+
+    # Adiciona quebras de linha e indentação
+    formatted = []
+    indent_level = 0
+    indent_str = '  '  # 2 espaços por nível
+
+    i = 0
+    current_line = ''
+
+    while i < len(query):
+        char = query[i]
+
+        # Detecta início de bloco
+        if char == '{':
+            if current_line.strip():
+                formatted.append(indent_str * indent_level + current_line.strip())
+                current_line = ''
+            formatted.append(indent_str * indent_level + '{')
+            indent_level += 1
+            i += 1
+            continue
+
+        # Detecta fim de bloco
+        elif char == '}':
+            if current_line.strip():
+                formatted.append(indent_str * indent_level + current_line.strip())
+                current_line = ''
+            indent_level -= 1
+            formatted.append(indent_str * indent_level + '}')
+            i += 1
+            continue
+
+        # Detecta parênteses de abertura (para argumentos)
+        elif char == '(':
+            current_line += char
+            # Captura todo o conteúdo entre parênteses
+            paren_depth = 1
+            i += 1
+            while i < len(query) and paren_depth > 0:
+                if query[i] == '(':
+                    paren_depth += 1
+                elif query[i] == ')':
+                    paren_depth -= 1
+                current_line += query[i]
+                i += 1
+            continue
+
+        # Adiciona caractere à linha atual
+        else:
+            current_line += char
+            i += 1
+
+    # Adiciona última linha se houver
+    if current_line.strip():
+        formatted.append(indent_str * indent_level + current_line.strip())
+
+    return '\n'.join(formatted)
 
 @app.route('/favicon.ico')
 def favicon():
